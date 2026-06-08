@@ -17,6 +17,11 @@ DEFAULT_MODEL = "htdemucs_ft"
 AVAILABLE_STEMS = ["drums", "vocals", "bass", "other", "all"]
 DEFAULT_STEM = "drums"
 
+# Output formats
+AVAILABLE_FORMATS = ["wav", "mp3"]
+DEFAULT_FORMAT = "wav"
+MP3_BITRATE = "320k"
+
 # Human-readable labels for the GUI
 STEM_LABELS = {
     "drums":  "Remove Drums",
@@ -64,23 +69,25 @@ def resolve_output_paths(
     input_path: Path,
     output_dir: Optional[Path],
     stem: str = DEFAULT_STEM,
+    output_format: str = DEFAULT_FORMAT,
 ) -> list[Path]:
     """
-    Return list of output Paths for the given stem mode.
+    Return list of output Paths for the given stem mode and format.
 
     For single-stem mode (e.g. 'drums'):
-        [<stem>_no_<stem>.wav, <stem>_<stem>.wav]
+        [<name>_no_<stem>.<ext>, <name>_<stem>.<ext>]
     For 'all' mode:
-        [<stem>_drums.wav, <stem>_bass.wav, <stem>_vocals.wav, <stem>_other.wav]
+        [<name>_drums.<ext>, <name>_bass.<ext>, <name>_vocals.<ext>, <name>_other.<ext>]
     """
     file_stem = input_path.stem
     out_dir = Path(output_dir) if output_dir else input_path.parent
+    ext = f".{output_format.lower()}"
 
     if stem == "all":
-        return [out_dir / f"{file_stem}_{s}.wav" for s in ["drums", "bass", "vocals", "other"]]
+        return [out_dir / f"{file_stem}_{s}{ext}" for s in ["drums", "bass", "vocals", "other"]]
     else:
-        isolated    = out_dir / f"{file_stem}_{stem}.wav"
-        without     = out_dir / f"{file_stem}_no_{stem}.wav"
+        without  = out_dir / f"{file_stem}_no_{stem}{ext}"
+        isolated = out_dir / f"{file_stem}_{stem}{ext}"
         return [without, isolated]
 
 
@@ -89,12 +96,43 @@ def check_overwrite(paths: list[Path]) -> list[Path]:
     return [p for p in paths if p.exists()]
 
 
+def _save_audio(tensor, sample_rate: int, out_path: Path, output_format: str) -> None:
+    """Save a (channels, samples) tensor to WAV or MP3."""
+    import numpy as np
+    import soundfile as sf
+    import subprocess
+    import tempfile
+
+    if output_format.lower() == "wav":
+        sf.write(str(out_path), tensor.numpy().T, sample_rate, subtype="PCM_24")
+    elif output_format.lower() == "mp3":
+        # Write a temp WAV then encode to MP3 via ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            sf.write(str(tmp_path), tensor.numpy().T, sample_rate, subtype="PCM_24")
+            cmd = [
+                "ffmpeg", "-y", "-i", str(tmp_path),
+                "-b:a", MP3_BITRATE,
+                "-q:a", "0",
+                str(out_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.decode(errors="replace"))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    else:
+        raise SeparationError(f"Unknown output format '{output_format}'. Choose wav or mp3.")
+
+
 def separate_stems(
     input_path: Path,
     stem: str = DEFAULT_STEM,
     output_dir: Optional[Path] = None,
     model: str = DEFAULT_MODEL,
     device_preference: str = "gpu",
+    output_format: str = DEFAULT_FORMAT,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> list[Path]:
     """
@@ -106,12 +144,13 @@ def separate_stems(
         output_dir:         Output directory. Defaults to same directory as input file.
         model:              Demucs model name (default: htdemucs_ft).
         device_preference:  'gpu' or 'cpu'.
+        output_format:      Output file format: 'wav' (default, 24-bit) or 'mp3' (320kbps).
         progress_callback:  Optional callable(fraction: float, message: str).
 
     Returns:
-        List of Paths to output WAV files.
-        - Single stem: [no_<stem>.wav, <stem>.wav]
-        - 'all':       [drums.wav, bass.wav, vocals.wav, other.wav]
+        List of Paths to output files.
+        - Single stem: [no_<stem>.<ext>, <stem>.<ext>]
+        - 'all':       [drums.<ext>, bass.<ext>, vocals.<ext>, other.<ext>]
 
     Raises:
         SeparationError on any user-facing problem.
@@ -181,37 +220,37 @@ def separate_stems(
 
     sources = sources.squeeze(0).cpu()  # (num_stems, channels, samples)
 
+    fmt = output_format.lower()
+    fmt_label = "MP3 (320kbps)" if fmt == "mp3" else "WAV (24-bit)"
     if progress_callback:
-        progress_callback(0.85, "Saving output files...")
+        progress_callback(0.85, f"Saving output files ({fmt_label})...")
 
     try:
-        import soundfile as sf
-
         output_paths = []
+        ext = f".{fmt}"
 
         if stem == "all":
-            # Write all 4 stems individually
             for i, name in enumerate(stem_names):
-                out_path = out_dir / f"{input_path.stem}_{name}.wav"
-                sf.write(str(out_path), sources[i].numpy().T, model_sr, subtype="PCM_24")
+                out_path = out_dir / f"{input_path.stem}_{name}{ext}"
+                _save_audio(sources[i], model_sr, out_path, fmt)
                 output_paths.append(out_path)
                 logging.info("Output: %s", out_path)
         else:
-            # Write isolated stem and "everything else" mix
-            stem_idx    = stem_names.index(stem)
-            isolated    = sources[stem_idx]
-            without     = sum(sources[i] for i in range(len(stem_names)) if i != stem_idx)
+            stem_idx      = stem_names.index(stem)
+            isolated      = sources[stem_idx]
+            without       = sum(sources[i] for i in range(len(stem_names)) if i != stem_idx)
+            without_path  = out_dir / f"{input_path.stem}_no_{stem}{ext}"
+            isolated_path = out_dir / f"{input_path.stem}_{stem}{ext}"
 
-            without_path   = out_dir / f"{input_path.stem}_no_{stem}.wav"
-            isolated_path  = out_dir / f"{input_path.stem}_{stem}.wav"
-
-            sf.write(str(without_path),  without.numpy().T,  model_sr, subtype="PCM_24")
-            sf.write(str(isolated_path), isolated.numpy().T, model_sr, subtype="PCM_24")
+            _save_audio(without,  model_sr, without_path,  fmt)
+            _save_audio(isolated, model_sr, isolated_path, fmt)
 
             output_paths = [without_path, isolated_path]
             logging.info("Output: %s", without_path)
             logging.info("Output: %s", isolated_path)
 
+    except SeparationError:
+        raise
     except Exception as e:
         raise SeparationError(f"Failed to write output files: {e}") from e
 

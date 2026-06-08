@@ -55,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  bass    — isolate or remove bass\n"
             "  other   — isolate or remove guitar/keys\n"
             "  all     — full 4-stem separation (drums, bass, vocals, other)\n\n"
+            "Output Formats:\n"
+            "  wav  — 24-bit WAV, best quality (default)\n"
+            "  mp3  — 320kbps MP3, ~8x smaller\n\n"
             "Models:\n"
             "  htdemucs_ft  — best quality, recommended (default)\n"
             "  htdemucs     — fast, good quality\n"
@@ -68,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stem to separate: drums, vocals, bass, other, all (default: drums)")
     p.add_argument("--model",       "-m", metavar="MODEL", default=None,
                    help="Demucs model (default from config, usually htdemucs_ft)")
+    p.add_argument("--format",      "-f", choices=["wav", "mp3"], default=None,
+                   help="Output format: wav (24-bit, default) or mp3 (320kbps)")
     p.add_argument("--device",      "-d", choices=["gpu", "cpu"], default=None,
                    help="Processing device (default from config, usually gpu)")
     p.add_argument("--list-models", action="store_true", help="List available models and exit")
@@ -108,9 +113,10 @@ def main() -> int:
     log_dir = Path(cfg.get("log_dir", "logs"))
     setup_logging(log_dir)
 
-    model  = args.model  or cfg.get("model",  "htdemucs_ft")
-    device = args.device or cfg.get("device", "gpu")
-    stem   = args.stem   or cfg.get("stem",   "drums")
+    model         = args.model  or cfg.get("model",         "htdemucs_ft")
+    device        = args.device or cfg.get("device",        "gpu")
+    stem          = args.stem   or cfg.get("stem",          "drums")
+    output_format = args.format or cfg.get("output_format", "wav")
 
     input_path = Path(args.input)
     output_dir = Path(args.output) if args.output else None
@@ -118,7 +124,7 @@ def main() -> int:
     from core import separate_stems, resolve_output_paths, check_overwrite, SeparationError, STEM_LABELS
 
     # Overwrite check
-    output_paths = resolve_output_paths(input_path, output_dir, stem)
+    output_paths = resolve_output_paths(input_path, output_dir, stem, output_format)
     existing = check_overwrite(output_paths)
     if existing:
         print("Warning: the following output file(s) already exist:")
@@ -134,6 +140,7 @@ def main() -> int:
     print(f"  Input : {input_path}")
     print(f"  Output: {output_paths[0].parent}")
     print(f"  Mode  : {label}")
+    print(f"  Format: {output_format.upper()}")
     print(f"  Model : {model}  |  Device: {device}")
     print()
 
@@ -148,6 +155,7 @@ def main() -> int:
             output_dir=output_dir,
             model=model,
             device_preference=device,
+            output_format=output_format,
             progress_callback=cli_progress,
         )
     except SeparationError as e:

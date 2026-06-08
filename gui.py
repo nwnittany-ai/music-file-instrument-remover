@@ -116,6 +116,18 @@ class DrumRemoverApp(tk.Tk):
                 command=self._on_stem_changed,
             ).grid(row=i // 2, column=i % 2, sticky="w", padx=16, pady=3)
 
+        # --- Output format ---
+        fmt_frame = ttk.LabelFrame(f, text="Output Format")
+        fmt_frame.pack(fill="x", **pad)
+
+        self._format_var = tk.StringVar(value=self._cfg.get("output_format", "wav"))
+        ttk.Radiobutton(fmt_frame, text="WAV  (24-bit, best quality)",
+                        variable=self._format_var, value="wav").pack(
+            side="left", padx=16, pady=4)
+        ttk.Radiobutton(fmt_frame, text="MP3  (320 kbps, ~10× smaller)",
+                        variable=self._format_var, value="mp3").pack(
+            side="left", padx=16, pady=4)
+
         # --- Output location ---
         out_frame = ttk.LabelFrame(f, text="Output Location")
         out_frame.pack(fill="x", **pad)
@@ -208,10 +220,11 @@ class DrumRemoverApp(tk.Tk):
         blank()
 
         h2("Options")
-        code('  --stem   -s  <stem>   Stem to separate (default: drums)')
-        code('  --output -o  <dir>    Output directory (default: same as input)')
-        code('  --model  -m  <model>  Demucs model (default: htdemucs_ft)')
-        code('  --device -d  gpu|cpu  Processing device (default: gpu)')
+        code('  --stem   -s  <stem>      Stem to separate (default: drums)')
+        code('  --format -f  wav|mp3    Output format (default: wav)')
+        code('  --output -o  <dir>      Output directory (default: same as input)')
+        code('  --model  -m  <model>    Demucs model (default: htdemucs_ft)')
+        code('  --device -d  gpu|cpu    Processing device (default: gpu)')
         code('  --list-stems          List available stems and exit')
         code('  --list-models         List available models and exit')
         code('  --version             Show version and exit')
@@ -400,13 +413,14 @@ class DrumRemoverApp(tk.Tk):
             messagebox.showwarning("No file", "Please select an input file first.")
             return
 
-        stem = self._stem_var.get()
+        stem          = self._stem_var.get()
+        output_format = self._format_var.get()
         output_dir = self._output_dir_override or (
             Path(self._cfg["default_output_dir"]) if self._cfg.get("default_output_dir") else None
         )
 
         # Overwrite check
-        output_paths = core.resolve_output_paths(self._input_path, output_dir, stem)
+        output_paths = core.resolve_output_paths(self._input_path, output_dir, stem, output_format)
         existing = core.check_overwrite(output_paths)
         if existing:
             names = "\n".join(p.name for p in existing)
@@ -434,6 +448,7 @@ class DrumRemoverApp(tk.Tk):
                     output_dir=output_dir,
                     model=model,
                     device_preference=device,
+                    output_format=output_format,
                     progress_callback=self._on_progress,
                 )
                 self.after(0, self._on_success, results)
