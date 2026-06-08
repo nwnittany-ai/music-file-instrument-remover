@@ -1,31 +1,41 @@
 """
-Core drum-removal logic — shared by CLI and GUI.
+Music File Instrument Remover — core separation logic.
 
-All Demucs interaction lives here. The CLI and GUI import from this module;
-neither duplicates this logic.
+Shared by CLI and GUI. All Demucs interaction lives here.
 """
 
 import logging
-import os
-import shutil
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
 SUPPORTED_EXTENSIONS = {".mp3", ".wav"}
+
 AVAILABLE_MODELS = ["htdemucs", "htdemucs_ft", "mdx", "mdx_extra", "mdx_q", "mdx_extra_q"]
-DEFAULT_MODEL = "htdemucs"
+DEFAULT_MODEL = "htdemucs_ft"
+
+# Stems supported for isolation. "all" = full 4-stem separation.
+AVAILABLE_STEMS = ["drums", "vocals", "bass", "other", "all"]
+DEFAULT_STEM = "drums"
+
+# Human-readable labels for the GUI
+STEM_LABELS = {
+    "drums":  "Remove Drums",
+    "vocals": "Remove Vocals",
+    "bass":   "Remove Bass",
+    "other":  "Remove Other (guitar/keys)",
+    "all":    "Full Separation (4 stems)",
+}
 
 
-class DrumRemoverError(Exception):
+class SeparationError(Exception):
     """Raised for user-facing errors (no raw tracebacks shown to users)."""
+
+# Keep old name as alias so any external code doesn't break
+DrumRemoverError = SeparationError
 
 
 def resolve_device(preference: str) -> str:
-    """
-    Return 'cuda' or 'cpu' based on preference and availability.
-    Logs a warning and falls back to CPU if GPU requested but unavailable.
-    """
+    """Return 'cuda' or 'cpu' based on preference and GPU availability."""
     if preference.lower() in ("gpu", "cuda"):
         try:
             import torch
@@ -40,26 +50,38 @@ def resolve_device(preference: str) -> str:
 
 def validate_input(input_path: Path) -> None:
     if not input_path.exists():
-        raise DrumRemoverError(f"Input file not found: {input_path}")
+        raise SeparationError(f"Input file not found: {input_path}")
     if not input_path.is_file():
-        raise DrumRemoverError(f"Input path is not a file: {input_path}")
+        raise SeparationError(f"Input path is not a file: {input_path}")
     if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-        raise DrumRemoverError(
+        raise SeparationError(
             f"Unsupported file format '{input_path.suffix}'. "
             f"Supported formats: {', '.join(SUPPORTED_EXTENSIONS)}"
         )
 
 
-def resolve_output_paths(input_path: Path, output_dir: Optional[Path]) -> tuple[Path, Path]:
+def resolve_output_paths(
+    input_path: Path,
+    output_dir: Optional[Path],
+    stem: str = DEFAULT_STEM,
+) -> list[Path]:
     """
-    Return (no_drums_path, drums_path) for the given input file.
-    If output_dir is None, output goes alongside the input file.
+    Return list of output Paths for the given stem mode.
+
+    For single-stem mode (e.g. 'drums'):
+        [<stem>_no_<stem>.wav, <stem>_<stem>.wav]
+    For 'all' mode:
+        [<stem>_drums.wav, <stem>_bass.wav, <stem>_vocals.wav, <stem>_other.wav]
     """
-    stem = input_path.stem
-    out_dir = output_dir if output_dir else input_path.parent
-    no_drums = out_dir / f"{stem}_no_drums.wav"
-    drums    = out_dir / f"{stem}_drums.wav"
-    return no_drums, drums
+    file_stem = input_path.stem
+    out_dir = Path(output_dir) if output_dir else input_path.parent
+
+    if stem == "all":
+        return [out_dir / f"{file_stem}_{s}.wav" for s in ["drums", "bass", "vocals", "other"]]
+    else:
+        isolated    = out_dir / f"{file_stem}_{stem}.wav"
+        without     = out_dir / f"{file_stem}_no_{stem}.wav"
+        return [without, isolated]
 
 
 def check_overwrite(paths: list[Path]) -> list[Path]:
@@ -67,29 +89,38 @@ def check_overwrite(paths: list[Path]) -> list[Path]:
     return [p for p in paths if p.exists()]
 
 
-def remove_drums(
+def separate_stems(
     input_path: Path,
+    stem: str = DEFAULT_STEM,
     output_dir: Optional[Path] = None,
     model: str = DEFAULT_MODEL,
     device_preference: str = "gpu",
     progress_callback: Optional[Callable[[float, str], None]] = None,
-) -> tuple[Path, Path]:
+) -> list[Path]:
     """
-    Run Demucs stem separation (drums vs. no_drums) on input_path.
+    Run Demucs stem separation on input_path.
 
     Args:
         input_path:         Path to input MP3 or WAV file.
-        output_dir:         Directory for output files. Defaults to input file's directory.
-        model:              Demucs model name (default: htdemucs).
+        stem:               Which stem to isolate: 'drums', 'vocals', 'bass', 'other', or 'all'.
+        output_dir:         Output directory. Defaults to same directory as input file.
+        model:              Demucs model name (default: htdemucs_ft).
         device_preference:  'gpu' or 'cpu'.
-        progress_callback:  Optional callable(fraction: float, message: str) for progress updates.
+        progress_callback:  Optional callable(fraction: float, message: str).
 
     Returns:
-        (no_drums_path, drums_path) — absolute Paths to the two output WAV files.
+        List of Paths to output WAV files.
+        - Single stem: [no_<stem>.wav, <stem>.wav]
+        - 'all':       [drums.wav, bass.wav, vocals.wav, other.wav]
 
     Raises:
-        DrumRemoverError on any user-facing problem.
+        SeparationError on any user-facing problem.
     """
+    if stem not in AVAILABLE_STEMS:
+        raise SeparationError(
+            f"Unknown stem '{stem}'. Choose from: {', '.join(AVAILABLE_STEMS)}"
+        )
+
     input_path = Path(input_path).resolve()
     validate_input(input_path)
 
@@ -97,9 +128,7 @@ def remove_drums(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(device_preference)
-    logging.info("Using device: %s", device)
-
-    no_drums_path, drums_path = resolve_output_paths(input_path, out_dir)
+    logging.info("Using device: %s | model: %s | stem: %s", device, model, stem)
 
     if progress_callback:
         progress_callback(0.0, f"Loading model '{model}'...")
@@ -110,7 +139,7 @@ def remove_drums(
         import torch
         import torchaudio
     except ImportError as e:
-        raise DrumRemoverError(f"Required package not installed: {e}") from e
+        raise SeparationError(f"Required package not installed: {e}") from e
 
     try:
         logging.info("Loading model: %s", model)
@@ -118,65 +147,106 @@ def remove_drums(
         demucs_model.to(device)
         demucs_model.eval()
     except Exception as e:
-        raise DrumRemoverError(f"Failed to load model '{model}': {e}") from e
+        raise SeparationError(f"Failed to load model '{model}': {e}") from e
+
+    model_sr   = demucs_model.samplerate
+    stem_names = list(demucs_model.sources)  # e.g. ['drums', 'bass', 'vocals', 'other']
+
+    # Validate the requested stem exists in this model
+    if stem != "all" and stem not in stem_names:
+        raise SeparationError(
+            f"Model '{model}' does not support stem '{stem}'. "
+            f"Available: {', '.join(stem_names)}"
+        )
 
     if progress_callback:
         progress_callback(0.1, "Loading audio...")
 
-    model_sr = demucs_model.samplerate
-
     try:
         from demucs.audio import AudioFile
-        audio_file = AudioFile(input_path)
-        # read() returns (channels, samples) tensor, resampled to model_sr, stereo
-        waveform = audio_file.read(streams=0, samplerate=model_sr, channels=2)
-        sample_rate = model_sr
+        waveform = AudioFile(input_path).read(streams=0, samplerate=model_sr, channels=2)
     except Exception as e:
-        raise DrumRemoverError(f"Could not read audio file: {e}") from e
+        raise SeparationError(f"Could not read audio file: {e}") from e
 
     if progress_callback:
         progress_callback(0.2, "Separating stems (this may take a minute)...")
 
-    # apply_model expects shape (batch, channels, samples)
-    waveform = waveform.unsqueeze(0).to(device)
+    waveform = waveform.unsqueeze(0).to(device)  # (1, channels, samples)
 
     try:
         with torch.no_grad():
             sources = apply_model(demucs_model, waveform, device=device, progress=False)
     except Exception as e:
-        raise DrumRemoverError(f"Stem separation failed: {e}") from e
+        raise SeparationError(f"Stem separation failed: {e}") from e
 
-    # sources shape: (batch, num_stems, channels, samples)
-    # Stem order depends on model; find drums index by name
-    stem_names = demucs_model.sources
-    if "drums" not in stem_names:
-        raise DrumRemoverError(f"Model '{model}' does not have a 'drums' stem.")
-
-    drums_idx = stem_names.index("drums")
     sources = sources.squeeze(0).cpu()  # (num_stems, channels, samples)
-
-    drums_audio   = sources[drums_idx]
-    no_drums_audio = sum(sources[i] for i in range(len(stem_names)) if i != drums_idx)
 
     if progress_callback:
         progress_callback(0.85, "Saving output files...")
 
     try:
         import soundfile as sf
-        import numpy as np
-        # soundfile expects (samples, channels); our tensors are (channels, samples)
-        sf.write(str(no_drums_path), no_drums_audio.numpy().T, sample_rate, subtype="PCM_24")
-        sf.write(str(drums_path),    drums_audio.numpy().T,    sample_rate, subtype="PCM_24")
+
+        output_paths = []
+
+        if stem == "all":
+            # Write all 4 stems individually
+            for i, name in enumerate(stem_names):
+                out_path = out_dir / f"{input_path.stem}_{name}.wav"
+                sf.write(str(out_path), sources[i].numpy().T, model_sr, subtype="PCM_24")
+                output_paths.append(out_path)
+                logging.info("Output: %s", out_path)
+        else:
+            # Write isolated stem and "everything else" mix
+            stem_idx    = stem_names.index(stem)
+            isolated    = sources[stem_idx]
+            without     = sum(sources[i] for i in range(len(stem_names)) if i != stem_idx)
+
+            without_path   = out_dir / f"{input_path.stem}_no_{stem}.wav"
+            isolated_path  = out_dir / f"{input_path.stem}_{stem}.wav"
+
+            sf.write(str(without_path),  without.numpy().T,  model_sr, subtype="PCM_24")
+            sf.write(str(isolated_path), isolated.numpy().T, model_sr, subtype="PCM_24")
+
+            output_paths = [without_path, isolated_path]
+            logging.info("Output: %s", without_path)
+            logging.info("Output: %s", isolated_path)
+
     except Exception as e:
-        raise DrumRemoverError(f"Failed to write output files: {e}") from e
+        raise SeparationError(f"Failed to write output files: {e}") from e
 
     if progress_callback:
         progress_callback(1.0, "Done.")
 
-    logging.info("Output: %s", no_drums_path)
-    logging.info("Output: %s", drums_path)
-    return no_drums_path, drums_path
+    return output_paths
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrapper — keeps old callers working unchanged
+# ---------------------------------------------------------------------------
+
+def remove_drums(
+    input_path: Path,
+    output_dir: Optional[Path] = None,
+    model: str = DEFAULT_MODEL,
+    device_preference: str = "gpu",
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> tuple[Path, Path]:
+    """Backward-compatible wrapper around separate_stems for drum removal."""
+    paths = separate_stems(
+        input_path=input_path,
+        stem="drums",
+        output_dir=output_dir,
+        model=model,
+        device_preference=device_preference,
+        progress_callback=progress_callback,
+    )
+    return paths[0], paths[1]  # (no_drums, drums)
 
 
 def list_models() -> list[str]:
     return list(AVAILABLE_MODELS)
+
+
+def list_stems() -> list[str]:
+    return list(AVAILABLE_STEMS)

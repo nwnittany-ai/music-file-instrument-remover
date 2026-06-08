@@ -1,15 +1,13 @@
 """
-Drum Remover — tkinter GUI
+Music File Instrument Remover — tkinter GUI
 
 Wraps core.py. All processing logic lives in core.py; this file handles
 only UI layout, user interaction, and threading.
 """
 
-import os
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -17,9 +15,9 @@ from tkinter import filedialog, messagebox, ttk
 import config
 import core
 
-APP_TITLE = "Drum Remover"
-VERSION = "0.1.0"
-WIN_W, WIN_H = 600, 480
+APP_TITLE = "Music File Instrument Remover"
+VERSION = "0.2.0"
+WIN_W, WIN_H = 620, 520
 
 
 # ---------------------------------------------------------------------------
@@ -57,14 +55,16 @@ class DrumRemoverApp(tk.Tk):
     def _build_menu(self):
         menubar = tk.Menu(self)
         help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="About", command=self._show_about)
+        help_menu.add_command(label="About...", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
         self.config(menu=menubar)
 
     def _show_about(self):
         messagebox.showinfo(
-            "About Drum Remover",
-            f"Drum Remover v{VERSION}\n\nUses Facebook Research Demucs for stem separation.\nGPU-accelerated via CUDA.",
+            "About",
+            f"{APP_TITLE} v{VERSION}\n\n"
+            "Uses Facebook Research Demucs for AI stem separation.\n"
+            "GPU-accelerated via CUDA.",
         )
 
     # ------------------------------------------------------------------
@@ -77,12 +77,15 @@ class DrumRemoverApp(tk.Tk):
 
         self._main_frame = ttk.Frame(nb)
         self._adv_frame  = ttk.Frame(nb)
+        self._help_frame = ttk.Frame(nb)
 
         nb.add(self._main_frame, text="  Main  ")
         nb.add(self._adv_frame,  text="  Advanced  ")
+        nb.add(self._help_frame, text="  CLI Reference  ")
 
         self._build_main_tab()
         self._build_advanced_tab()
+        self._build_help_tab()
 
     # ------------------------------------------------------------------
     # Main tab
@@ -98,9 +101,20 @@ class DrumRemoverApp(tk.Tk):
 
         self._input_var = tk.StringVar(value="No file selected")
         ttk.Label(input_frame, textvariable=self._input_var, anchor="w",
-                  width=55, relief="sunken", padding=4).pack(side="left", padx=6, pady=6)
+                  width=58, relief="sunken", padding=4).pack(side="left", padx=6, pady=6)
         ttk.Button(input_frame, text="Browse…", command=self._browse_input).pack(
             side="left", padx=(0, 6), pady=6)
+
+        # --- Stem selector ---
+        stem_frame = ttk.LabelFrame(f, text="Separation Mode")
+        stem_frame.pack(fill="x", **pad)
+
+        self._stem_var = tk.StringVar(value=self._cfg.get("stem", core.DEFAULT_STEM))
+        for i, (key, label) in enumerate(core.STEM_LABELS.items()):
+            ttk.Radiobutton(
+                stem_frame, text=label, variable=self._stem_var, value=key,
+                command=self._on_stem_changed,
+            ).grid(row=i // 2, column=i % 2, sticky="w", padx=16, pady=3)
 
         # --- Output location ---
         out_frame = ttk.LabelFrame(f, text="Output Location")
@@ -108,16 +122,15 @@ class DrumRemoverApp(tk.Tk):
 
         self._output_label_var = tk.StringVar()
         ttk.Label(out_frame, textvariable=self._output_label_var, anchor="w",
-                  width=55, relief="sunken", padding=4).pack(side="left", padx=6, pady=6)
+                  width=58, relief="sunken", padding=4).pack(side="left", padx=6, pady=6)
         ttk.Button(out_frame, text="Save As…", command=self._browse_output).pack(
             side="left", padx=(0, 6), pady=6)
 
         # --- Action button ---
-        self._remove_btn = ttk.Button(
-            f, text="Remove Drums", command=self._start_processing,
-            style="Accent.TButton",
+        self._run_btn = ttk.Button(
+            f, text=self._action_label(), command=self._start_processing,
         )
-        self._remove_btn.pack(pady=(10, 4))
+        self._run_btn.pack(pady=(10, 4))
 
         # --- Progress bar ---
         prog_frame = ttk.Frame(f)
@@ -125,7 +138,7 @@ class DrumRemoverApp(tk.Tk):
 
         self._progress_var = tk.DoubleVar(value=0)
         self._progress_bar = ttk.Progressbar(
-            prog_frame, variable=self._progress_var, maximum=100, length=560,
+            prog_frame, variable=self._progress_var, maximum=100, length=580,
         )
         self._progress_bar.pack(fill="x", pady=(4, 2))
 
@@ -141,7 +154,115 @@ class DrumRemoverApp(tk.Tk):
         self._open_folder_btn = ttk.Button(
             f, text="Open Output Folder", command=self._open_output_folder,
         )
-        # shown only after a successful run
+
+    def _action_label(self) -> str:
+        return core.STEM_LABELS.get(self._stem_var.get(), "Separate Stems")
+
+    def _on_stem_changed(self):
+        self._run_btn.config(text=self._action_label())
+        self._hide_open_folder_btn()
+        self._status_var.set("Ready.")
+        self._progress_var.set(0)
+        self._pct_var.set("")
+
+    # ------------------------------------------------------------------
+    # Help tab
+    # ------------------------------------------------------------------
+
+    def _build_help_tab(self):
+        f = self._help_frame
+
+        text = tk.Text(f, wrap="word", padx=12, pady=10, relief="flat",
+                       font=("Consolas", 9), background=self.cget("background"))
+        scroll = ttk.Scrollbar(f, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+
+        # --- Tag styles ---
+        text.tag_configure("h1",   font=("Segoe UI", 11, "bold"), spacing3=4)
+        text.tag_configure("h2",   font=("Segoe UI", 10, "bold"), spacing1=8, spacing3=2)
+        text.tag_configure("code", font=("Consolas", 9), background="#e8e8e8")
+        text.tag_configure("body", font=("Segoe UI", 9))
+
+        def h1(t):  text.insert("end", t + "\n", "h1")
+        def h2(t):  text.insert("end", t + "\n", "h2")
+        def code(t): text.insert("end", t + "\n", "code")
+        def body(t): text.insert("end", t + "\n", "body")
+        def blank():  text.insert("end", "\n")
+
+        h1("Music File Instrument Remover — CLI Reference")
+        body(f"Version {VERSION}")
+        blank()
+
+        h2("Launching the GUI")
+        code('  .venv\\Scripts\\python.exe gui.py')
+        blank()
+
+        h2("CLI Syntax")
+        code('  python drumremover.py --input <file> [options]')
+        blank()
+
+        h2("Required Argument")
+        code('  --input  -i  <file>   Input MP3 or WAV file')
+        blank()
+
+        h2("Options")
+        code('  --stem   -s  <stem>   Stem to separate (default: drums)')
+        code('  --output -o  <dir>    Output directory (default: same as input)')
+        code('  --model  -m  <model>  Demucs model (default: htdemucs_ft)')
+        code('  --device -d  gpu|cpu  Processing device (default: gpu)')
+        code('  --list-stems          List available stems and exit')
+        code('  --list-models         List available models and exit')
+        code('  --version             Show version and exit')
+        code('  --help                Show this help and exit')
+        blank()
+
+        h2("Available Stems")
+        code('  drums    Remove or isolate drums')
+        code('  vocals   Remove or isolate vocals (karaoke)')
+        code('  bass     Remove or isolate bass')
+        code('  other    Remove or isolate guitar/keys')
+        code('  all      Full 4-stem separation (drums, bass, vocals, other)')
+        blank()
+
+        h2("Available Models")
+        code('  htdemucs_ft  Best quality — recommended  (default)')
+        code('  htdemucs     Fast, good quality')
+        code('  mdx_extra    Alternative architecture, competitive quality')
+        code('  mdx          Lighter/faster, lower quality')
+        code('  mdx_q        Quantized mdx — fastest, lowest quality')
+        code('  mdx_extra_q  Quantized mdx_extra')
+        blank()
+
+        h2("Examples")
+        code('  python drumremover.py --input "C:\\Music\\demo.mp3"')
+        code('  python drumremover.py --input "C:\\Music\\demo.mp3" --stem vocals')
+        code('  python drumremover.py --input "C:\\Music\\demo.mp3" --stem all')
+        code('  python drumremover.py --input "C:\\Music\\demo.mp3" --output "C:\\Music\\Output"')
+        code('  python drumremover.py --input "C:\\Music\\demo.mp3" --model htdemucs --device cpu')
+        blank()
+
+        h2("Output Files")
+        body('  Single stem (e.g. --stem drums):')
+        code('    demo_no_drums.wav   Everything except drums')
+        code('    demo_drums.wav      Isolated drums')
+        blank()
+        body('  Full separation (--stem all):')
+        code('    demo_drums.wav')
+        code('    demo_bass.wav')
+        code('    demo_vocals.wav')
+        code('    demo_other.wav')
+        blank()
+
+        h2("Notes")
+        body('  • Output format is always 24-bit WAV (best quality for Suno uploads).')
+        body('  • GPU acceleration requires an NVIDIA GPU with CUDA support.')
+        body('  • MP3 input requires ffmpeg to be installed and on your PATH.')
+        body('  • Settings in the Advanced tab are saved to drumremover_config.json.')
+        body('  • Logs are written to the logs/ folder by default.')
+
+        text.configure(state="disabled")  # read-only
 
     # ------------------------------------------------------------------
     # Advanced tab
@@ -149,7 +270,6 @@ class DrumRemoverApp(tk.Tk):
 
     def _build_advanced_tab(self):
         f = self._adv_frame
-        pad = {"padx": 12, "pady": 8}
 
         row = 0
 
@@ -180,9 +300,9 @@ class DrumRemoverApp(tk.Tk):
         # Model
         lbl("Demucs model:", row)
         self._model_var = tk.StringVar(value=self._cfg.get("model", core.DEFAULT_MODEL))
-        model_cb = ttk.Combobox(f, textvariable=self._model_var,
-                                values=core.list_models(), state="readonly", width=36)
-        model_cb.grid(row=row, column=1, sticky="ew", pady=6)
+        ttk.Combobox(f, textvariable=self._model_var,
+                     values=core.list_models(), state="readonly", width=36).grid(
+            row=row, column=1, sticky="ew", pady=6)
         row += 1
 
         # Device
@@ -208,7 +328,6 @@ class DrumRemoverApp(tk.Tk):
 
         f.columnconfigure(1, weight=1)
 
-        # Save button
         ttk.Button(f, text="Save Settings", command=self._save_settings).grid(
             row=row, column=0, columnspan=3, pady=16)
 
@@ -226,7 +345,7 @@ class DrumRemoverApp(tk.Tk):
         if path:
             self._input_path = Path(path)
             self._input_var.set(str(self._input_path))
-            self._output_dir_override = None  # reset any prior Save As choice
+            self._output_dir_override = None
             self._update_output_label()
             self._hide_open_folder_btn()
             self._status_var.set("Ready.")
@@ -281,13 +400,14 @@ class DrumRemoverApp(tk.Tk):
             messagebox.showwarning("No file", "Please select an input file first.")
             return
 
+        stem = self._stem_var.get()
         output_dir = self._output_dir_override or (
             Path(self._cfg["default_output_dir"]) if self._cfg.get("default_output_dir") else None
         )
 
         # Overwrite check
-        no_drums_path, drums_path = core.resolve_output_paths(self._input_path, output_dir)
-        existing = core.check_overwrite([no_drums_path, drums_path])
+        output_paths = core.resolve_output_paths(self._input_path, output_dir, stem)
+        existing = core.check_overwrite(output_paths)
         if existing:
             names = "\n".join(p.name for p in existing)
             if not messagebox.askyesno(
@@ -300,7 +420,7 @@ class DrumRemoverApp(tk.Tk):
         device = self._cfg.get("device", "gpu")
 
         self._processing = True
-        self._remove_btn.config(state="disabled")
+        self._run_btn.config(state="disabled")
         self._hide_open_folder_btn()
         self._progress_var.set(0)
         self._pct_var.set("")
@@ -308,15 +428,16 @@ class DrumRemoverApp(tk.Tk):
 
         def run():
             try:
-                no_drums, drums = core.remove_drums(
+                results = core.separate_stems(
                     input_path=self._input_path,
+                    stem=stem,
                     output_dir=output_dir,
                     model=model,
                     device_preference=device,
                     progress_callback=self._on_progress,
                 )
-                self.after(0, self._on_success, no_drums)
-            except core.DrumRemoverError as e:
+                self.after(0, self._on_success, results)
+            except core.SeparationError as e:
                 self.after(0, self._on_error, str(e))
             except Exception as e:
                 self.after(0, self._on_error, f"Unexpected error: {e}")
@@ -325,22 +446,23 @@ class DrumRemoverApp(tk.Tk):
 
     def _on_progress(self, fraction: float, message: str):
         pct = int(fraction * 100)
-        self.after(0, self._progress_var.set, pct * 1.0)
+        self.after(0, self._progress_var.set, float(pct))
         self.after(0, self._pct_var.set, f"{pct}%")
         self.after(0, self._status_var.set, message)
 
-    def _on_success(self, no_drums_path: Path):
+    def _on_success(self, results: list[Path]):
         self._processing = False
-        self._remove_btn.config(state="normal")
+        self._run_btn.config(state="normal")
         self._progress_var.set(100)
         self._pct_var.set("100%")
-        self._status_var.set(f"Done! ✔  {no_drums_path.name}")
-        self._last_output_dir = no_drums_path.parent
+        count = len(results)
+        self._status_var.set(f"Done! ✔  {count} file(s) written to {results[0].parent.name}")
+        self._last_output_dir = results[0].parent
         self._show_open_folder_btn()
 
     def _on_error(self, message: str):
         self._processing = False
-        self._remove_btn.config(state="normal")
+        self._run_btn.config(state="normal")
         self._status_var.set(f"Error: {message}")
         messagebox.showerror("Error", message)
 

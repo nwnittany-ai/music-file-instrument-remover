@@ -1,13 +1,14 @@
 """
-Drum Remover — CLI entry point.
+Music File Instrument Remover — CLI entry point.
 
 Usage:
     python drumremover.py --input <filepath> [options]
     python drumremover.py --list-models
+    python drumremover.py --list-stems
     python drumremover.py --version
 
-All core logic lives in core.py. This file is purely argument parsing,
-logging setup, user-facing output, and exit codes.
+All core logic lives in core.py. This file handles argument parsing,
+logging setup, user-facing output, and exit codes only.
 """
 
 import argparse
@@ -16,13 +17,12 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def setup_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "drumremover.log"
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -41,21 +41,37 @@ def cli_progress(fraction: float, message: str) -> None:
     bar = "#" * filled + "-" * (bar_len - filled)
     print(f"\r  [{bar}] {pct:3d}%  {message:<45}", end="", flush=True)
     if fraction >= 1.0:
-        print()  # newline after 100%
+        print()
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="drumremover",
-        description="Remove drums from an audio file using Demucs stem separation.",
+        description=(
+            "Separate stems from an audio file using Demucs AI stem separation.\n\n"
+            "Stems:\n"
+            "  drums   — isolate or remove drums (default)\n"
+            "  vocals  — isolate or remove vocals (karaoke)\n"
+            "  bass    — isolate or remove bass\n"
+            "  other   — isolate or remove guitar/keys\n"
+            "  all     — full 4-stem separation (drums, bass, vocals, other)\n\n"
+            "Models:\n"
+            "  htdemucs_ft  — best quality, recommended (default)\n"
+            "  htdemucs     — fast, good quality\n"
+            "  mdx_extra    — alternative architecture\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--input",  "-i", metavar="FILE",  help="Input MP3 or WAV file")
-    p.add_argument("--output", "-o", metavar="DIR",   help="Output directory (default: same as input)")
-    p.add_argument("--model",  "-m", metavar="MODEL", default=None,
-                   help="Demucs model to use (default from config, usually htdemucs)")
-    p.add_argument("--device", "-d", choices=["gpu", "cpu"], default=None,
+    p.add_argument("--input",       "-i", metavar="FILE",  help="Input MP3 or WAV file")
+    p.add_argument("--output",      "-o", metavar="DIR",   help="Output directory (default: same as input)")
+    p.add_argument("--stem",        "-s", metavar="STEM",  default=None,
+                   help="Stem to separate: drums, vocals, bass, other, all (default: drums)")
+    p.add_argument("--model",       "-m", metavar="MODEL", default=None,
+                   help="Demucs model (default from config, usually htdemucs_ft)")
+    p.add_argument("--device",      "-d", choices=["gpu", "cpu"], default=None,
                    help="Processing device (default from config, usually gpu)")
     p.add_argument("--list-models", action="store_true", help="List available models and exit")
+    p.add_argument("--list-stems",  action="store_true", help="List available stems and exit")
     p.add_argument("--version",     action="store_true", help="Show version and exit")
     return p
 
@@ -65,7 +81,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.version:
-        print(f"Drum Remover v{VERSION}")
+        print(f"Music File Instrument Remover v{VERSION}")
         return 0
 
     if args.list_models:
@@ -73,6 +89,13 @@ def main() -> int:
         print("Available models:")
         for m in list_models():
             print(f"  {m}")
+        return 0
+
+    if args.list_stems:
+        from core import STEM_LABELS
+        print("Available stems:")
+        for key, label in STEM_LABELS.items():
+            print(f"  {key:<8} — {label}")
         return 0
 
     if not args.input:
@@ -85,17 +108,18 @@ def main() -> int:
     log_dir = Path(cfg.get("log_dir", "logs"))
     setup_logging(log_dir)
 
-    model  = args.model  or cfg.get("model",  "htdemucs")
+    model  = args.model  or cfg.get("model",  "htdemucs_ft")
     device = args.device or cfg.get("device", "gpu")
+    stem   = args.stem   or cfg.get("stem",   "drums")
 
-    input_path  = Path(args.input)
-    output_dir  = Path(args.output) if args.output else None
+    input_path = Path(args.input)
+    output_dir = Path(args.output) if args.output else None
 
-    from core import remove_drums, resolve_output_paths, check_overwrite, DrumRemoverError
+    from core import separate_stems, resolve_output_paths, check_overwrite, SeparationError, STEM_LABELS
 
-    # Warn before overwrite
-    no_drums_path, drums_path = resolve_output_paths(input_path, output_dir)
-    existing = check_overwrite([no_drums_path, drums_path])
+    # Overwrite check
+    output_paths = resolve_output_paths(input_path, output_dir, stem)
+    existing = check_overwrite(output_paths)
     if existing:
         print("Warning: the following output file(s) already exist:")
         for p in existing:
@@ -105,29 +129,30 @@ def main() -> int:
             print("Aborted.")
             return 0
 
-    print(f"\nDrum Remover v{VERSION}")
+    label = STEM_LABELS.get(stem, stem)
+    print(f"\nMusic File Instrument Remover v{VERSION}")
     print(f"  Input : {input_path}")
-    print(f"  Output: {no_drums_path.parent}")
+    print(f"  Output: {output_paths[0].parent}")
+    print(f"  Mode  : {label}")
     print(f"  Model : {model}  |  Device: {device}")
     print()
 
     start = time.time()
-    logging.info(
-        "Starting removal — input=%s  model=%s  device=%s",
-        input_path, model, device,
-    )
+    logging.info("Starting — input=%s  stem=%s  model=%s  device=%s",
+                 input_path, stem, model, device)
 
     try:
-        no_drums, drums = remove_drums(
+        results = separate_stems(
             input_path=input_path,
+            stem=stem,
             output_dir=output_dir,
             model=model,
             device_preference=device,
             progress_callback=cli_progress,
         )
-    except DrumRemoverError as e:
+    except SeparationError as e:
         print(f"\nError: {e}", file=sys.stderr)
-        logging.error("DrumRemoverError: %s", e)
+        logging.error("SeparationError: %s", e)
         return 1
     except Exception as e:
         print(f"\nUnexpected error: {e}", file=sys.stderr)
@@ -135,11 +160,12 @@ def main() -> int:
         return 1
 
     elapsed = time.time() - start
-    logging.info("Completed in %.1f s — no_drums=%s  drums=%s", elapsed, no_drums, drums)
+    logging.info("Completed in %.1f s", elapsed)
 
     print(f"\nCompleted in {elapsed:.1f}s")
-    print(f"  No-drums: {no_drums}")
-    print(f"  Drums   : {drums}")
+    print("Output files:")
+    for p in results:
+        print(f"  {p}")
     return 0
 
 
