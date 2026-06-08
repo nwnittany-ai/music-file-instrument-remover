@@ -1,0 +1,23 @@
+# Virtual environment
+.venv/
+
+# Saved settings (user-specific)
+drumremover_config.json
+
+# Log files
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Output audio files
+*.wav
+*.mp3
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
