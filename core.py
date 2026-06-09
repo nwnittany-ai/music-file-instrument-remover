@@ -96,6 +96,54 @@ def check_overwrite(paths: list[Path]) -> list[Path]:
     return [p for p in paths if p.exists()]
 
 
+def _copy_metadata(input_path: Path, output_path: Path, stem_label: str) -> None:
+    """
+    Copy ID3/metadata tags from input_path to output_path.
+    Adds a COMM (comment) tag identifying which stem the file contains.
+    Silently skips if input has no tags or mutagen can't handle the format.
+    """
+    try:
+        from mutagen import File
+        from mutagen.id3 import ID3, COMM, TIT2
+        from mutagen.mp3 import MP3
+        from mutagen.wave import WAVE
+
+        src = File(str(input_path))
+        if src is None or src.tags is None:
+            return
+
+        dst = File(str(output_path), easy=False)
+        if dst is None:
+            return
+
+        # Ensure destination has a tag container
+        if dst.tags is None:
+            dst.add_tags()
+
+        # Copy all tags from source
+        for key, value in src.tags.items():
+            try:
+                dst.tags[key] = value
+            except Exception:
+                pass  # skip any tag that doesn't apply to the output format
+
+        # Add/overwrite a comment tag identifying the stem
+        comment_tag = COMM(encoding=3, lang="eng", desc="stem", text=[stem_label])
+        try:
+            dst.tags.add(comment_tag)
+        except Exception:
+            try:
+                dst.tags["COMM::eng"] = comment_tag
+            except Exception:
+                pass
+
+        dst.save()
+        logging.debug("Metadata copied to %s (stem: %s)", output_path.name, stem_label)
+
+    except Exception as e:
+        logging.warning("Could not copy metadata to %s: %s", output_path.name, e)
+
+
 def _save_audio(tensor, sample_rate: int, out_path: Path, output_format: str) -> None:
     """Save a (channels, samples) tensor to WAV or MP3."""
     import numpy as np
@@ -233,6 +281,7 @@ def separate_stems(
             for i, name in enumerate(stem_names):
                 out_path = out_dir / f"{input_path.stem}_{name}{ext}"
                 _save_audio(sources[i], model_sr, out_path, fmt)
+                _copy_metadata(input_path, out_path, name)
                 output_paths.append(out_path)
                 logging.info("Output: %s", out_path)
         else:
@@ -243,7 +292,9 @@ def separate_stems(
             isolated_path = out_dir / f"{input_path.stem}_{stem}{ext}"
 
             _save_audio(without,  model_sr, without_path,  fmt)
+            _copy_metadata(input_path, without_path, f"no_{stem}")
             _save_audio(isolated, model_sr, isolated_path, fmt)
+            _copy_metadata(input_path, isolated_path, stem)
 
             output_paths = [without_path, isolated_path]
             logging.info("Output: %s", without_path)

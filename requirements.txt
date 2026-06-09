@@ -5,3 +5,4 @@
 #   pip install -r requirements.txt
 
 demucs>=4.0.1
+mutagen>=1.47.0
