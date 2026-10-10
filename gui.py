@@ -18,7 +18,7 @@ from lyricsync_tab import LyricTimingTab
 
 APP_TITLE = "Music File Instrument Remover"
 VERSION = "0.3.0"
-WIN_W, WIN_H = 640, 700
+WIN_W, WIN_H = 640, 760
 
 
 # ---------------------------------------------------------------------------

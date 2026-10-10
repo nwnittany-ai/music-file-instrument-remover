@@ -121,3 +121,11 @@ Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ig
 of the same song skips Demucs. After the first alignment pass, any line that failed, sits where the
 vocal track is silent, or is far from its rough time is re-aligned on the audio between the
 nearest good lines; a retry is kept only if it leaves fewer bad lines.
+
+**Processor choice.** `--device auto` (the default) uses the GPU only when `nvidia-smi` reports enough
+free memory for the job (about 4 GB for Demucs, 3.5 GB for Whisper `medium`, 6.5 GB for `large-v3`),
+otherwise the CPU, so it will not fight a running animation job. `--device gpu|cpu` forces it. If
+"auto" picks the GPU and it still runs out of memory, the run is retried on the CPU. The Lyric Timing
+tab has the same Auto / GPU / CPU choice, shows the GPU's free memory (refreshed every 10 s), and asks
+before running on the GPU when it is short of memory. This tab's choice is separate from the Advanced
+tab's device setting, which still controls the Main tab.

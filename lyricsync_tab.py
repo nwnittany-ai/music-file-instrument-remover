@@ -63,8 +63,16 @@ class LyricTimingTab:
         ttk.Combobox(opt, textvariable=self._model_var, values=MODELS, state="readonly", width=10).pack(side="left")
         self._words_var = tk.BooleanVar(value=bool(self._cfg.get("lyric_words", False)))
         ttk.Checkbutton(opt, text="Per-word times in .lrc", variable=self._words_var).pack(side="left", padx=16)
-        ttk.Label(opt, text="(medium is the default; large-v3 is slower but handles harder songs)",
-                  foreground="gray").pack(side="left")
+        ttk.Label(opt, text="(large-v3 is slower but handles harder songs)", foreground="gray").pack(side="left")
+
+        dev = ttk.LabelFrame(f, text="Processor")
+        dev.pack(fill="x", **pad)
+        self._device_var = tk.StringVar(value=self._cfg.get("lyric_device", "auto"))
+        for value, text in (("auto", "Auto (GPU only if it has room)"), ("gpu", "GPU"), ("cpu", "CPU (slower, leaves the GPU free)")):
+            ttk.Radiobutton(dev, text=text, variable=self._device_var, value=value).pack(side="left", padx=10, pady=4)
+        self._gpu_var = tk.StringVar(value="GPU: checking…")
+        ttk.Label(dev, textvariable=self._gpu_var, foreground="gray").pack(side="right", padx=10)
+        self._poll_gpu()
 
         self._run_btn = ttk.Button(f, text="Time the Lyrics", command=self._start)
         self._run_btn.pack(pady=(6, 2))
@@ -105,6 +113,19 @@ class LyricTimingTab:
             self._lyrics.delete("1.0", "end")
             self._lyrics.insert("1.0", Path(path).read_text(encoding="utf-8-sig"))
 
+    def _poll_gpu(self):
+        """Show how much GPU memory is free, refreshed every 10 s. nvidia-smi runs on a worker thread
+        so a slow reply never freezes the window."""
+        def check():
+            st = lyricsync.gpu_status()
+            text = "GPU: not found" if st is None else f"GPU: {st[0]:.1f} of {st[1]:.1f} GB free"
+            try:
+                self._root.after(0, self._gpu_var.set, text)
+            except Exception:
+                pass  # window already closed
+        threading.Thread(target=check, daemon=True).start()
+        self._root.after(10000, self._poll_gpu)
+
     def _copy(self):
         self._root.clipboard_clear()
         self._root.clipboard_append(self._result.get("1.0", "end").strip())
@@ -138,10 +159,20 @@ class LyricTimingTab:
         if existing and not messagebox.askyesno(
                 "Overwrite?", "These files already exist:\n\n" + "\n".join(p.name for p in existing) + "\n\nOverwrite?"):
             return
-        model, words = self._model_var.get(), self._words_var.get()
-        self._cfg["lyric_model"], self._cfg["lyric_words"] = model, words
-        config.set("lyric_model", model)
-        config.set("lyric_words", words)
+        model, words, device = self._model_var.get(), self._words_var.get(), self._device_var.get()
+        demucs_model = self._cfg.get("model", "htdemucs_ft")
+        if device == "gpu":
+            st = lyricsync.gpu_status()
+            need = lyricsync.needed_gb(model, lyricsync.cached_vocals_path(self._audio, demucs_model) is None)
+            if st and st[0] < need and not messagebox.askyesno(
+                    "GPU is busy",
+                    f"Only {st[0]:.1f} GB of GPU memory is free and this needs about {need:.1f} GB.\n"
+                    "Another program (such as the animation tool) may be using it; running now could "
+                    "slow it down or make one of the jobs fail.\n\nRun on the GPU anyway?"):
+                return
+        for key, value in (("lyric_model", model), ("lyric_words", words), ("lyric_device", device)):
+            self._cfg[key] = value
+            config.set(key, value)
 
         self._busy = True
         self._run_btn.config(state="disabled")
@@ -150,8 +181,7 @@ class LyricTimingTab:
         self._progress.set(0)
         self._set_result("")
         self._status.set("Starting…")
-        audio, device = self._audio, self._cfg.get("device", "gpu")
-        demucs_model = self._cfg.get("model", "htdemucs_ft")
+        audio = self._audio
 
         def progress(frac, msg):
             if frac is not None:
@@ -176,7 +206,7 @@ class LyricTimingTab:
         self._last_dir = Path(res["output_dir"])
         self._progress.set(100)
         note = "" if not res["flagged"] else f"  {res['flagged']} line(s) marked ! - worth a second look."
-        self._status.set(f"Done ✔  {res['lines']} lines timed.{note}")
+        self._status.set(f"Done ✔  {res['lines']} lines timed on the {res['device_used'].upper()}.{note}")
         self._set_result(res["timed_text"] + "\n" + res["report"] + "\n")
 
     def _failed(self, message: str):
