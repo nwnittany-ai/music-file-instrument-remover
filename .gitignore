@@ -21,3 +21,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# lyricsync test material (songs, stems, outputs)
+test_data/

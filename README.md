@@ -96,3 +96,22 @@ Planned features (not yet implemented):
 ## License
 
 MIT
+
+## Lyric timing (`lyricsync.py`)
+
+Timestamps a lyrics text file against a song (e.g. for planning video/animation cuts):
+
+```
+python lyricsync.py "song.mp3" lyrics.txt
+python lyricsync.py "song.mp3" lyrics.txt --words          # per-word tags in the .lrc
+python lyricsync.py "song.mp3" lyrics.txt --vocals "song_vocals.wav"   # reuse an existing vocal stem
+```
+
+It separates the vocals with Demucs, then force-aligns the lyrics to them with stable-ts (Whisper
+`medium` by default; `--model large-v3` for harder songs). Lyrics format: one sung line per line;
+`[Section]` labels, a `[title] ...` line and lines with no letters are skipped; an optional leading
+`m:ss` on a line is treated as a rough time and used as a cross-check. Outputs, next to the song
+(or in `--output-dir`): `<song>_timed.txt` (paste into Claude chat), `<song>.lrc`, and
+`<song>_timing.json` (always includes per-word times and confidence). Lines the aligner gave up on
+are retried on the audio between their neighbours; anything still doubtful is marked `!`.
+All logic is in `lyricsync_core.py`.
