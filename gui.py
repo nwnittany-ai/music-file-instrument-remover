@@ -14,10 +14,11 @@ from tkinter import filedialog, messagebox, ttk
 
 import config
 import core
+from lyricsync_tab import LyricTimingTab
 
 APP_TITLE = "Music File Instrument Remover"
-VERSION = "0.2.0"
-WIN_W, WIN_H = 620, 520
+VERSION = "0.3.0"
+WIN_W, WIN_H = 640, 700
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +77,17 @@ class DrumRemoverApp(tk.Tk):
         nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         self._main_frame = ttk.Frame(nb)
+        self._lyric_frame = ttk.Frame(nb)
         self._adv_frame  = ttk.Frame(nb)
         self._help_frame = ttk.Frame(nb)
 
         nb.add(self._main_frame, text="  Main  ")
+        nb.add(self._lyric_frame, text="  Lyric Timing  ")
         nb.add(self._adv_frame,  text="  Advanced  ")
         nb.add(self._help_frame, text="  CLI Reference  ")
 
         self._build_main_tab()
+        self._lyric_tab = LyricTimingTab(self, self._lyric_frame, self._cfg)
         self._build_advanced_tab()
         self._build_help_tab()
 

@@ -115,3 +115,9 @@ It separates the vocals with Demucs, then force-aligns the lyrics to them with s
 `<song>_timing.json` (always includes per-word times and confidence). Lines the aligner gave up on
 are retried on the audio between their neighbours; anything still doubtful is marked `!`.
 All logic is in `lyricsync_core.py`.
+
+The GUI has the same thing as the **Lyric Timing** tab (paste lyrics, pick a song, copy the result).
+Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ignored) so a re-run
+of the same song skips Demucs. After the first alignment pass, any line that failed, sits where the
+vocal track is silent, or is far from its rough time is re-aligned on the audio between the
+nearest good lines; a retry is kept only if it leaves fewer bad lines.

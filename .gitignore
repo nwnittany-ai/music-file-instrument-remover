@@ -24,3 +24,6 @@ desktop.ini
 
 # lyricsync test material (songs, stems, outputs)
 test_data/
+
+# cached vocal stems for lyricsync
+lyricsync_cache/

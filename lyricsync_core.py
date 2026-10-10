@@ -41,6 +41,7 @@ class Line:
     confidence: Optional[float] = None  # mean word probability, 0-1, when the aligner provides it
     words: list = field(default_factory=list)  # [{"word", "start", "end", "probability"}]
     flags: list = field(default_factory=list)
+    repaired: bool = False             # re-timed by the second pass (kept out of flags: it passed the checks)
 
 
 def find_title(text: str) -> Optional[str]:
@@ -198,51 +199,125 @@ def audio_duration(path: Path) -> Optional[float]:
         return None
 
 
+VOICED_MIN_FRACTION = 0.4   # a line needs at least this much singing under it (vocal-track loudness)
+HINT_PAD_BEFORE = 6.0       # when retrying, look this far before the user's rough time...
+HINT_PAD_AFTER = 8.0        # ...and this far after the last line's rough time
+REPAIR_ROUNDS = 4
+
+
+def voiced_mask(audio, sample_rate: int, hop_s: float = 0.02):
+    """Per-20ms 'is someone singing' flags from the vocal track's loudness. Threshold is relative
+    to the track's own loud passages, so it works for quiet and loud songs alike."""
+    import numpy as np
+
+    hop = max(1, int(sample_rate * hop_s))
+    n = len(audio) // hop
+    if n == 0:
+        return np.zeros(0, dtype=bool), hop_s
+    frames = audio[:n * hop].reshape(n, hop)
+    rms = np.sqrt((frames.astype("float64") ** 2).mean(axis=1))
+    return rms > max(1e-4, 0.1 * float(np.percentile(rms, 90))), hop_s
+
+
+def voiced_fraction(mask, hop_s: float, t0: float, t1: float) -> float:
+    a, b = int(t0 / hop_s), max(int(t1 / hop_s), int(t0 / hop_s) + 1)
+    seg = mask[a:b]
+    return float(seg.mean()) if len(seg) else 1.0
+
+
 def _is_failed(l: Line) -> bool:
     """Whisper sometimes gives up on a stretch and squeezes its lines into a near-zero span."""
     return l.start is None or (l.end - l.start) < SUSPICIOUS_MIN_SECONDS or (l.confidence or 1.0) < FAILED_CONFIDENCE
 
 
-def repair_failed(model, audio_path: str, lines: list[Line], language: str, say) -> list[int]:
-    """Re-align each run of failed lines on only the audio between the neighbouring lines that did
-    align. Returns the indexes of lines that were re-timed."""
+def _is_bad(l: Line, mask, hop_s: float) -> bool:
+    """Failed, or placed where nobody is singing, or far from the user's own rough time."""
+    if _is_failed(l):
+        return True
+    if voiced_fraction(mask, hop_s, l.start, l.end) < VOICED_MIN_FRACTION:
+        return True
+    return l.hint is not None and abs(l.start - l.hint) > HINT_TOLERANCE_SECONDS
+
+
+def repair_failed(model, audio_path: str, lines: list[Line], language: str, say):
+    """Re-align every run of bad lines on only the audio between the nearest good lines (narrowed
+    by the user's rough times when given). Tries the run alone, then widened by one line each side.
+    A retry is kept only if it leaves fewer bad lines. Repeats while it keeps making progress.
+    Returns (indexes of lines that were re-timed, voiced mask, mask hop in seconds)."""
     from types import SimpleNamespace
 
     from whisper.audio import SAMPLE_RATE, load_audio
 
-    failed = [_is_failed(l) for l in lines]
-    if not any(failed) or all(failed):
-        return []
-    audio = None
-    fixed: list[int] = []
-    i = 0
-    while i < len(lines):
-        if not failed[i]:
-            i += 1
-            continue
-        j = i
-        while j + 1 < len(lines) and failed[j + 1]:
-            j += 1
-        before = next((lines[k] for k in range(i - 1, -1, -1) if not failed[k]), None)
-        after = next((lines[k] for k in range(j + 1, len(lines)) if not failed[k]), None)
-        t0 = before.end if before else 0.0
-        if audio is None:
-            audio = load_audio(audio_path)
-        t1 = after.start if after else len(audio) / SAMPLE_RATE
-        group = lines[i:j + 1]
-        say(f"Retrying lines {i + 1}-{j + 1} on {t0:.1f}s-{t1:.1f}s...")
-        try:
-            res = model.align(audio[int(t0 * SAMPLE_RATE):int(t1 * SAMPLE_RATE)],
-                              "\n".join(l.text for l in group), language=language, original_split=True)
-            shifted = [SimpleNamespace(word=w.word, start=w.start + t0, end=w.end + t0,
-                                       probability=getattr(w, "probability", None)) for w in res.all_words()]
-            map_words_to_lines(group, shifted)
-            if not any(_is_failed(l) for l in group):
-                fixed.extend(range(i, j + 1))
-        except Exception as exc:
-            say(f"  retry failed: {exc}")
-        i = j + 1
-    return fixed
+    audio = load_audio(audio_path)
+    total = len(audio) / SAMPLE_RATE
+    mask, hop_s = voiced_mask(audio, SAMPLE_RATE)
+    touched: set[int] = set()
+
+    def bad_flags() -> list[bool]:
+        return [_is_bad(l, mask, hop_s) for l in lines]
+
+    def snapshot(group):
+        return [(l.start, l.end, l.confidence, l.words) for l in group]
+
+    def restore(group, snap):
+        for l, (s, e, c, w) in zip(group, snap):
+            l.start, l.end, l.confidence, l.words = s, e, c, w
+
+    for _ in range(REPAIR_ROUNDS):
+        bad = bad_flags()
+        if not any(bad) or all(bad):
+            break
+        progressed = False
+        i = 0
+        while i < len(lines):
+            if not bad[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(lines) and bad[j + 1]:
+                j += 1
+            fixed_group = False
+            reached = j
+            for widen in (0, 1):
+                a, b = max(0, i - widen), min(len(lines) - 1, j + widen)
+                group = lines[a:b + 1]
+                before = next((lines[k] for k in range(a - 1, -1, -1) if not bad[k]), None)
+                after = next((lines[k] for k in range(b + 1, len(lines)) if not bad[k]), None)
+                lo = before.end if before else 0.0
+                hi = after.start if after else total
+                if group[0].hint is not None and group[0].hint - HINT_PAD_BEFORE > lo:
+                    lo = group[0].hint - HINT_PAD_BEFORE
+                if group[-1].hint is not None and group[-1].hint + HINT_PAD_AFTER < hi:
+                    hi = group[-1].hint + HINT_PAD_AFTER
+                n_words = sum(len(l.text.split()) for l in group)
+                if hi - lo < 0.3 * n_words:
+                    continue  # no room for these words; try a wider window or give up
+                say(f"Retrying lines {a + 1}-{b + 1} on {lo:.1f}s-{hi:.1f}s...")
+                snap = snapshot(group)
+                before_bad = sum(_is_bad(l, mask, hop_s) for l in group if l.start is not None) + \
+                    sum(1 for l in group if l.start is None)
+                try:
+                    res = model.align(audio[int(lo * SAMPLE_RATE):int(hi * SAMPLE_RATE)],
+                                      "\n".join(l.text for l in group), language=language, original_split=True)
+                    shifted = [SimpleNamespace(word=w.word, start=w.start + lo, end=w.end + lo,
+                                               probability=getattr(w, "probability", None)) for w in res.all_words()]
+                    map_words_to_lines(group, shifted)
+                    after_bad = sum(_is_bad(l, mask, hop_s) for l in group)
+                    if after_bad < before_bad:
+                        touched.update(range(a, b + 1))
+                        progressed = fixed_group = True
+                        reached = max(j, b)
+                        break
+                    restore(group, snap)
+                except Exception as exc:
+                    restore(group, snap)
+                    say(f"  retry failed: {exc}")
+            i = reached + 1
+            if fixed_group:
+                bad = bad_flags()  # neighbours' windows depend on what is now good
+        if not progressed:
+            break
+    return sorted(touched), mask, hop_s
 
 
 def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium", device: str = "cuda",
@@ -262,11 +337,13 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     words = list(result.all_words())
     map_words_to_lines(lines, words)
     flag_lines(lines)
-    repaired = repair_failed(model, str(vocals_path), lines, language, say)
-    if repaired:
-        flag_lines(lines)
-        for i in repaired:
-            lines[i].flags.append("re-aligned in a second pass")
+    repaired, mask, hop_s = repair_failed(model, str(vocals_path), lines, language, say)
+    flag_lines(lines)
+    for l in lines:
+        if l.start is not None and voiced_fraction(mask, hop_s, l.start, l.end) < VOICED_MIN_FRACTION:
+            l.flags.append("little singing detected at this time")
+    for i in repaired:
+        lines[i].repaired = True
     del model
     try:
         import torch
