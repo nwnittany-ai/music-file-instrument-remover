@@ -17,11 +17,12 @@ import lyricsync
 MODELS = ["small", "medium", "large-v3"]
 
 # Under pythonw (launch.bat) there is no console, and the progress bars in the speech-model
-# libraries crash when stdout/stderr are None.
+# libraries (e.g. the model download) crash when stdout/stderr are None. The replacement streams
+# must be UTF-8: with the default Windows encoding the bars' block characters raise UnicodeEncodeError.
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
+    sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
 if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+    sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
 
 
 class LyricTimingTab:
