@@ -116,6 +116,18 @@ It separates the vocals with Demucs, then force-aligns the lyrics to them with s
 are retried on the audio between their neighbours; anything still doubtful is marked `!`.
 All logic is in `lyricsync_core.py`.
 
+**How the timing is found.** The tool first finds where the singing actually is: stretches of the vocal track
+separated by silences of 3 seconds or more (a silent intro, a guitar solo). It then matches your lyric sections to
+those stretches - by how long each stretch is compared with how many words the section has, preferring to split
+where a new `[Section]` starts (especially after a label such as `[Guitar Solo]`, `[Guitar Fill]` or `[Intro]`,
+which signal a break) and where your own rough times agree - and aligns each section inside its own stretch, so the
+speech model never has to cross a long instrumental part. The `_timed.txt` header lists where the singing was found
+and which lines went with it, and warns when a stretch is much longer or shorter than its lines should take (a sign
+the pairing may be wrong). A stretch the aligner cannot place is spread over the singing by word count and flagged
+`estimated`. Songs with no clear gaps are aligned in one pass, as before. Sung words score low on Whisper's confidence
+even when placed correctly, so a line is only marked `!` below 0.3.
+Tests (no pytest or model needed): `.venv\Scripts\python.exe tests	est_lyricsync.py`.
+
 The GUI has the same thing as the **Lyric Timing** tab (paste lyrics, pick a song, copy the result).
 Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ignored) so a re-run
 of the same song skips Demucs. After the first alignment pass, any line that failed, sits where the

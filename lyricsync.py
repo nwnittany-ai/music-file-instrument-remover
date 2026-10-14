@@ -147,19 +147,20 @@ def _pipeline(audio: Path, lyrics_text: str, output_dir: Path, model: str, devic
         vocal_path = audio
         say(0.7, "Skipping vocal separation (aligning against the full mix).")
 
-    lc.align_vocals(vocal_path, lines, model_name=model, device=("cuda" if device == "gpu" else "cpu"),
-                    language=language, progress=lambda m: say(0.85, m))
+    found = lc.align_vocals(vocal_path, lines, model_name=model, device=("cuda" if device == "gpu" else "cpu"),
+                            language=language, progress=lambda m: say(0.85, m))
 
     stem = audio.stem
     duration = lc.audio_duration(audio)
     meta = {"title": title, "audio": str(audio), "vocals": str(vocal_path), "model": model, "language": language,
-            "device": device, "duration": duration, "line_count": len(lines)}
+            "device": device, "duration": duration, "line_count": len(lines),
+            "alignment_mode": found["mode"], "singing_blocks": found["blocks"]}
     files = {
         "timed": output_dir / f"{stem}_timed.txt",
         "lrc": output_dir / f"{stem}.lrc",
         "json": output_dir / f"{stem}_timing.json",
     }
-    timed_text = lc.to_timed_text(lines, title, duration)
+    timed_text = lc.to_timed_text(lines, title, duration, blocks=found["blocks"])
     files["timed"].write_text(timed_text, encoding="utf-8")
     files["lrc"].write_text(lc.to_lrc(lines, words=words), encoding="utf-8")
     files["json"].write_text(lc.to_json(lines, meta), encoding="utf-8")
