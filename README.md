@@ -126,7 +126,7 @@ and which lines went with it, and warns when a stretch is much longer or shorter
 the pairing may be wrong). A stretch the aligner cannot place is spread over the singing by word count and flagged
 `estimated`. Songs with no clear gaps are aligned in one pass, as before. Sung words score low on Whisper's confidence
 even when placed correctly, so a line is only marked `!` below 0.3.
-Tests (no pytest or model needed): `.venv\Scripts\python.exe tests	est_lyricsync.py`.
+Tests (no pytest or model needed): `.venv\Scripts\python.exe tests\test_lyricsync.py`.
 
 The GUI has the same thing as the **Lyric Timing** tab (paste lyrics, pick a song, copy the result).
 Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ignored) so a re-run
