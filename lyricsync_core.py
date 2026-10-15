@@ -26,8 +26,13 @@ FAILED_CONFIDENCE = 0.1       # below this a line is treated as a failed alignme
 SUSPICIOUS_MAX_SECONDS = 25.0  # ...and so is one longer than this
 
 # --- finding where the singing is (see find_sung_blocks / plan_blocks) ---
-BLOCK_MIN_GAP_S = 3.0          # silence at least this long ends a block of singing (shorter pauses are breaths)
 BLOCK_MIN_LENGTH_S = 1.5       # a "block" shorter than this is a blip (stray noise, a shout), not a verse
+BLOCK_MIN_RUN_S = 0.25         # a stretch of sound shorter than this is noise, not singing, when measuring pauses
+# What counts as a break is measured from the song itself, not fixed: ordinary pauses between sung lines are all
+# about the same length (2-3.3 s in the songs tried so far), instrumental breaks are much longer. A fixed 3 s cut-off
+# sat right at the size of an ordinary pause and chopped a verse into line-sized pieces (see choose_gap_threshold).
+BLOCK_BREAK_MIN_S = 5.0        # a pause must last at least this long to be an instrumental break
+BLOCK_BREAK_JUMP = 1.6         # ...and be at least this many times longer than the longest ordinary pause
 BLOCK_PAD_S = 1.5              # extra audio on each side of a block when aligning, so edge words are not clipped
 INSTRUMENTAL_WORDS = ("guitar", "solo", "fill", "instrumental", "interlude", "break", "intro", "drum", "riff")
 PLAN_NON_SECTION_CUT_PENALTY = 6.0   # seconds-equivalent cost of splitting a block's lyrics in the middle of a section
@@ -141,12 +146,15 @@ def flag_lines(lines: list[Line]) -> None:
 
 
 def _clock(t: float, tenths: bool = True) -> str:
-    m, s = divmod(max(t, 0.0), 60)
-    return f"{int(m)}:{s:04.1f}" if tenths else f"{int(m)}:{int(s):02d}"
+    if not tenths:
+        m, s = divmod(max(t, 0.0), 60)
+        return f"{int(m)}:{int(s):02d}"
+    m, s = divmod(round(max(t, 0.0) * 10) / 10, 60)  # round first, so 59.97 s reads 1:00.0 and never 0:60.0
+    return f"{int(m)}:{s:04.1f}"
 
 
 def _lrc_stamp(t: float) -> str:
-    m, s = divmod(max(t, 0.0), 60)
+    m, s = divmod(round(max(t, 0.0) * 100) / 100, 60)
     return f"{int(m):02d}:{s:05.2f}"
 
 
@@ -251,22 +259,51 @@ def voiced_fraction(mask, hop_s: float, t0: float, t1: float) -> float:
     return float(seg.mean()) if len(seg) else 1.0
 
 
-def find_sung_blocks(mask, hop_s: float, min_gap_s: float = BLOCK_MIN_GAP_S,
-                     min_length_s: float = BLOCK_MIN_LENGTH_S) -> list[tuple[float, float]]:
-    """Where the singing is: runs of 'voiced' frames in the vocal track, joined across pauses shorter than
-    min_gap_s (breaths), dropping anything shorter than min_length_s (stray noise). Returns [(start_s, end_s)]."""
+def _sound_runs(mask, hop_s: float) -> list[tuple[float, float]]:
+    """(start_s, end_s) of each stretch of sound in the vocal track, ignoring specks shorter than BLOCK_MIN_RUN_S."""
     import numpy as np
 
     m = np.asarray(mask, dtype=bool)
     if m.size == 0 or not m.any():
         return []
-    edges = np.flatnonzero(np.concatenate(([False], m, [False]))[1:] != np.concatenate(([False], m, [False]))[:-1])
+    padded = np.concatenate(([False], m, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(float(s), float(e)) for s, e in zip(edges[0::2] * hop_s, edges[1::2] * hop_s) if e - s >= BLOCK_MIN_RUN_S]
+
+
+def choose_gap_threshold(gaps: list[float]) -> Optional[float]:
+    """Where to draw the line between an ordinary pause and an instrumental break, from the song's own pauses.
+
+    Pauses between sung lines are all about the same length; breaks (a fill, a solo, an intro) are much longer.
+    The line goes at the shortest pause length where the next one up is both a real break (>= BLOCK_BREAK_MIN_S) and
+    clearly longer (>= BLOCK_BREAK_JUMP x). A virtual 1 s pause is included so a song whose every pause is a long
+    break is handled. Returns None when no pause stands out as a break (the whole song is one stretch of singing).
+    """
+    ordered = [1.0] + sorted(g for g in gaps if g >= 1.0)
+    for lower, upper in zip(ordered, ordered[1:]):
+        if upper >= BLOCK_BREAK_MIN_S and upper / lower >= BLOCK_BREAK_JUMP:
+            return (lower * upper) ** 0.5
+    return None
+
+
+def find_sung_blocks(mask, hop_s: float, min_gap_s: Optional[float] = None,
+                     min_length_s: float = BLOCK_MIN_LENGTH_S) -> list[tuple[float, float]]:
+    """Where the singing is: stretches of sound in the vocal track, joined across pauses shorter than min_gap_s,
+    dropping anything shorter than min_length_s (stray noise). min_gap_s defaults to the song's own break length
+    (choose_gap_threshold); a song with no real break comes back as one block. Returns [(start_s, end_s)]."""
+    runs = _sound_runs(mask, hop_s)
+    if not runs:
+        return []
+    if min_gap_s is None:
+        min_gap_s = choose_gap_threshold([b[0] - a[1] for a, b in zip(runs, runs[1:])])
+        if min_gap_s is None:
+            return [(runs[0][0], runs[-1][1])] if runs[-1][1] - runs[0][0] >= min_length_s else []
     blocks: list[tuple[float, float]] = []
-    for s, e in zip(edges[0::2] * hop_s, edges[1::2] * hop_s):
+    for s, e in runs:
         if blocks and s - blocks[-1][1] < min_gap_s:
-            blocks[-1] = (blocks[-1][0], float(e))
+            blocks[-1] = (blocks[-1][0], e)
         else:
-            blocks.append((float(s), float(e)))
+            blocks.append((s, e))
     return [(s, e) for s, e in blocks if e - s >= min_length_s]
 
 
@@ -503,8 +540,11 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     audio = load_audio(str(vocals_path))
     total = len(audio) / SAMPLE_RATE
     mask, hop_s = voiced_mask(audio, SAMPLE_RATE)
+    runs = _sound_runs(mask, hop_s)
+    break_s = choose_gap_threshold([b[0] - a[1] for a, b in zip(runs, runs[1:])])
     blocks = find_sung_blocks(mask, hop_s)
-    info: dict = {"mode": "whole song", "blocks": []}
+    info: dict = {"mode": "whole song", "blocks": [],
+                  "break_length_s": None if break_s is None else round(break_s, 1)}  # pauses longer than this split the singing
     estimated: set[int] = set()
 
     if len(blocks) >= 2:

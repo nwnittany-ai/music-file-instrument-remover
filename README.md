@@ -117,7 +117,10 @@ are retried on the audio between their neighbours; anything still doubtful is ma
 All logic is in `lyricsync_core.py`.
 
 **How the timing is found.** The tool first finds where the singing actually is: stretches of the vocal track
-separated by silences of 3 seconds or more (a silent intro, a guitar solo). It then matches your lyric sections to
+separated by instrumental breaks (a silent intro, a fill, a guitar solo). What counts as a break is measured from
+the song itself: the pauses between sung lines are all about the same length (2-3.3 s in the songs tried so far) and
+breaks are much longer, so the cut-off is placed where the pauses jump in length (a fixed 3 s rule chopped a slow
+song's verses into line-sized pieces). It then matches your lyric sections to
 those stretches - by how long each stretch is compared with how many words the section has, preferring to split
 where a new `[Section]` starts (especially after a label such as `[Guitar Solo]`, `[Guitar Fill]` or `[Intro]`,
 which signal a break) and where your own rough times agree - and aligns each section inside its own stretch, so the

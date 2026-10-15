@@ -144,6 +144,44 @@ def test_find_sung_blocks_edge_cases():
     assert only[0] == 0.0 and abs(only[1] - 20.0) < 0.05
 
 
+def test_break_length_comes_from_the_songs_own_pauses_not_a_fixed_number():
+    # the pauses measured in the song that broke a fixed 3 s rule: line pauses 3.0-3.3 s, breaks of 9.6 s and 29.8 s
+    gaps = [3.0, 3.0, 9.6, 3.1, 3.1, 29.8, 3.1, 3.0, 3.1, 3.3, 3.1, 4.4, 3.1, 3.1]
+    thr = lc.choose_gap_threshold(gaps)
+    assert 4.4 < thr < 9.6
+    assert sum(g > thr for g in gaps) == 2                       # only the two real breaks split the song
+    shorter = [2.1, 2.4, 2.8, 2.6, 12.0, 2.5, 21.9, 38.2]       # the first recording: pauses 2-3 s
+    assert 2.8 < lc.choose_gap_threshold(shorter) < 12.0
+
+
+def test_break_length_edge_cases():
+    assert lc.choose_gap_threshold([]) is None
+    assert lc.choose_gap_threshold([2.8, 3.1, 3.0, 2.9]) is None            # only ordinary pauses: no break at all
+    assert lc.choose_gap_threshold([3.0, 3.6, 4.3, 5.2, 6.3, 7.6]) is None  # a smooth continuum: nothing stands out
+    assert lc.choose_gap_threshold([0.3, 0.5, 0.8]) is None                  # micro-pauses are ignored
+    assert 1.0 < lc.choose_gap_threshold([8.0]) < 8.0                        # a single long break splits the song
+    both = lc.choose_gap_threshold([8.0, 10.0])                              # a song where every pause is a break
+    assert both is not None and both < 8.0
+
+
+def test_a_slow_song_whose_line_pauses_look_like_breaks_is_not_chopped_into_lines():
+    # 12 sung lines, 1.5 s each, 3.1 s apart; then a 9.6 s break; 12 more; a 29.8 s break; 12 more
+    runs, t = [], 0.0
+    for part in range(3):
+        for _ in range(12):
+            runs.append((t, t + 1.5))
+            t += 1.5 + 3.1
+        t += (9.6 if part == 0 else 29.8) - 3.1
+    blocks = lc.find_sung_blocks(_mask(runs, t + 5), 0.02)
+    assert len(blocks) == 3
+    assert abs(blocks[0][0] - 0.0) < 0.1 and abs(blocks[1][0] - runs[12][0]) < 0.1 and abs(blocks[2][0] - runs[24][0]) < 0.1
+
+
+def test_a_song_with_only_ordinary_pauses_is_one_block():
+    runs = [(i * 4.6, i * 4.6 + 1.5) for i in range(20)]
+    assert len(lc.find_sung_blocks(_mask(runs, 100.0), 0.02)) == 1
+
+
 # ----------------------------------------------------------------------------------------------- matching sections to blocks
 
 def test_plan_matches_sections_to_blocks_of_the_right_size():
@@ -250,13 +288,46 @@ def test_a_block_the_aligner_cannot_place_is_spread_over_the_singing_and_flagged
         assert len({round(l.start, 1) for l in lines}) == 9
 
 
+def test_slow_verses_with_three_second_line_pauses_still_pair_with_the_right_section():
+    """The failure from the second recording: each verse is 4 lines sung 1.5 s apart by 3.1 s pauses; the solos are
+    9.6 s and 29.8 s. A fixed 3 s rule chopped each verse into line-sized pieces and mis-assigned them."""
+    verse = ["alpha beta gamma", "delta epsilon zeta", "eta theta iota", "kappa lambda mu"]
+    text = ("[Verse 1]\n" + "\n".join(verse) + "\n[Guitar Fill]\n[Verse 2]\n" + "\n".join(verse) +
+            "\n[Guitar Solo]\n[Verse 3]\n" + "\n".join(verse) + "\n")
+    bursts, t = [], 4.0
+    for part in range(3):
+        for _ in range(4):
+            bursts.append((t, t + 1.5))
+            t += 1.5 + 3.1
+        t += (9.6 if part == 0 else 29.8) - 3.1
+    with tempfile.TemporaryDirectory() as d:
+        wav = _song(bursts, t + 4, Path(d) / "voc.wav")
+        lines = lc.parse_lyrics(text)
+        with patched_model(FakeModel()):
+            info = lc.align_vocals(wav, lines, model_name="x", device="cpu")
+        assert info["mode"] == "singing blocks" and len(info["blocks"]) == 3
+        assert [(b["first_line"], b["last_line"]) for b in info["blocks"]] == [(1, 4), (5, 8), (9, 12)]
+        assert lines[8].start > bursts[7][1] + 25   # Verse 3 begins after the long solo, not before it
+        assert lines[4].start > bursts[3][1] + 5    # ...and Verse 2 after the fill
+        assert [l.start for l in lines] == sorted(l.start for l in lines)
+        assert info["break_length_s"] is not None and 3.2 < info["break_length_s"] < 9.6
+
+
+def test_times_never_read_sixty_seconds():
+    assert lc._clock(59.97) == "1:00.0" and lc._clock(179.96) == "3:00.0" and lc._clock(75.34) == "1:15.3"
+    assert lc._clock(0.0) == "0:00.0" and lc._clock(-1) == "0:00.0" and lc._clock(125.0, tenths=False) == "2:05"
+    assert lc._lrc_stamp(59.999) == "01:00.00" and lc._lrc_stamp(61.234) == "01:01.23" and lc._lrc_stamp(0) == "00:00.00"
+    line = lc.Line(0, "x", start=119.97, end=122.0)
+    assert "2:00.0 - 2:02.0" in lc.to_timed_text([line], "t", 130.0)
+
+
 def test_a_song_with_no_gaps_is_aligned_in_one_pass_like_before():
     with tempfile.TemporaryDirectory() as d:
         wav = _song([(2.0, 30.0)], 32.0, Path(d) / "voc.wav")
         lines = lc.parse_lyrics("[V]\n" + "\n".join("la la la" for _ in range(4)))
         with patched_model(FakeModel()) as model:
             info = lc.align_vocals(wav, lines, model_name="x", device="cpu")
-        assert info == {"mode": "whole song", "blocks": []}
+        assert info["mode"] == "whole song" and info["blocks"] == [] and info["break_length_s"] is None
         assert model.calls[0][0] == "path"   # the whole file, exactly as the original code did
 
 
