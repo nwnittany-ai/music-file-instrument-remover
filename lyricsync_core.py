@@ -41,7 +41,15 @@ PLAN_SKIP_BLOCK_PENALTY = 3.0        # extra cost for deciding a block of singin
 PLAN_HINT_MISS_PENALTY = 10.0        # the user's rough time falls outside the block a line was assigned to
 PLAN_HINT_SLACK_S = 4.0
 FIT_OK_RANGE = (0.5, 2.0)       # block length / expected length outside this is reported as worth a look
-ESTIMATE_FLAG = "estimated: spread over the singing block by word count (alignment failed here)"
+TRIM_PAD_S = 0.2               # a line's end is placed this far after the last singing under it...
+TRIM_MAX_INNER_GAP_S = 3.0     # ...and never reaches across a silence longer than this (that is the next section's singing)
+SECTION_WORDS = ("verse", "chorus", "bridge", "intro", "outro", "pre", "refrain", "hook", "solo", "interlude",
+                 "instrumental", "break", "guitar", "drum", "fill", "riff", "coda", "tag", "vamp", "breakdown")
+EVIDENCE_WEIGHT = 3.0          # seconds-equivalent value of one lyric word heard in a block (see plan_blocks)
+EVIDENCE_LENGTH_WEIGHT = 0.1   # with that evidence, block length is only a tie-breaker
+EVIDENCE_FUZZY = 0.75          # two words this similar (difflib ratio) count as the same when matching a transcript
+TRIM_ECHO_GAP_S = 2.0          # for a line followed by echo lines: a silence this long ends the line (the echo is next)
+ESTIMATE_FLAG ="estimated: spread over the singing block by word count (alignment failed here)"
 
 
 class LyricSyncError(Exception):
@@ -61,6 +69,13 @@ class Line:
     flags: list = field(default_factory=list)
     repaired: bool = False             # re-timed by the second pass (kept out of flags: it passed the checks)
     labels: list = field(default_factory=list)  # every [label] between the previous sung line and this one
+    echoes: list = field(default_factory=list)  # "(echo)" lines written right after this line: sung, but not timed
+
+    @property
+    def sung_text(self) -> str:
+        """What is actually sung for this line, echoes included. This is what the aligner is given, so the echo's
+        singing is matched to the echo's words instead of being squeezed into the end of the line before it."""
+        return " ".join([self.text] + list(self.echoes))
 
 
 def find_title(text: str) -> Optional[str]:
@@ -69,6 +84,11 @@ def find_title(text: str) -> Optional[str]:
         if m and m.group(1).strip():
             return m.group(1).strip()
     return None
+
+
+def _is_section_name(label: str) -> bool:
+    """"(Chorus)" is a section label; "(Who will he see next?)" is an echo line. Told apart by section words."""
+    return any(w in SECTION_WORDS for w in re.findall(r"[a-z]+", label.lower()))
 
 
 def parse_lyrics(text: str) -> list[Line]:
@@ -82,7 +102,12 @@ def parse_lyrics(text: str) -> list[Line]:
         if not s or TITLE_RE.match(s):
             continue
         if SECTION_RE.match(s):
-            pending_labels.append(s.strip("[]() ").strip())
+            label = s.strip("[]() ").strip()
+            if s.lstrip().startswith("(") and not _is_section_name(label):
+                if lines and not pending_labels:   # an echo / ad-lib: it belongs to the line it follows
+                    lines[-1].echoes.append(label)
+                continue
+            pending_labels.append(label)
             continue
         hint = None
         m = HINT_RE.match(s)
@@ -103,15 +128,15 @@ def map_words_to_lines(lines: list[Line], words: list) -> None:
     """Assign aligned words (objects with .word/.start/.end/.probability) to lyric lines by
     counting whitespace-separated tokens per line. Alignment keeps the text's order, so repeated
     choruses each get their own time. Raises if the counts disagree (tokenisation mismatch)."""
-    expected = sum(len(l.text.split()) for l in lines)
+    expected = sum(len(l.sung_text.split()) for l in lines)
     if len(words) != expected:
         raise LyricSyncError(
             f"Aligner returned {len(words)} words but the lyrics have {expected}; cannot map lines safely."
         )
     i = 0
     for line in lines:
-        n = len(line.text.split())
-        chunk = words[i:i + n]
+        n = len(line.sung_text.split())
+        chunk = words[i:i + len(line.text.split())]   # the echo words that follow are not part of the line
         i += n
         line.words = [
             {"word": w.word.strip(), "start": round(float(w.start), 3), "end": round(float(w.end), 3),
@@ -173,12 +198,15 @@ def to_lrc(lines: list[Line], words: bool = False) -> str:
     return "\n".join(out) + "\n"
 
 
-def to_timed_text(lines: list[Line], title: str, duration: Optional[float], blocks: Optional[list] = None) -> str:
+def to_timed_text(lines: list[Line], title: str, duration: Optional[float], blocks: Optional[list] = None,
+                  mode: Optional[str] = None) -> str:
     """Readable summary meant to be pasted into Claude chat/design: where lyrics begin and end,
     instrumental gaps, then every line with its start-end time. `blocks` (from align_vocals) adds where
-    the singing was found."""
+    the singing was found; `mode` says which alignment path was used ("singing blocks" or "whole song")."""
     timed = [l for l in lines if l.start is not None]
     out = [f"Song: {title}" + (f"  (length {_clock(duration)})" if duration else "")]
+    if mode:
+        out.append(f"Alignment: {mode}")
     if blocks:
         out.append("Singing found at: " + ", ".join(
             f"{_clock(b['start'])}-{_clock(b['end'])}"
@@ -277,13 +305,65 @@ def choose_gap_threshold(gaps: list[float]) -> Optional[float]:
     Pauses between sung lines are all about the same length; breaks (a fill, a solo, an intro) are much longer.
     The line goes at the shortest pause length where the next one up is both a real break (>= BLOCK_BREAK_MIN_S) and
     clearly longer (>= BLOCK_BREAK_JUMP x). A virtual 1 s pause is included so a song whose every pause is a long
-    break is handled. Returns None when no pause stands out as a break (the whole song is one stretch of singing).
+    break is handled. When pauses grow gradually (no clear jump, e.g. 4.3, 6.3, 10.0, 10.4) it falls back to the plain
+    minimum: every pause of at least BLOCK_BREAK_MIN_S is a break. Returns None only when no pause is that long (the
+    whole song is one stretch of singing).
     """
+    jump = _jump_threshold(gaps)
+    if jump is not None:
+        return jump
+    return BLOCK_BREAK_MIN_S if max([1.0] + [g for g in gaps if g >= 1.0]) >= BLOCK_BREAK_MIN_S else None
+
+
+def _jump_threshold(gaps: list[float]) -> Optional[float]:
+    """The clear-jump rule on its own (see choose_gap_threshold); None when no pause stands out that way."""
     ordered = [1.0] + sorted(g for g in gaps if g >= 1.0)
     for lower, upper in zip(ordered, ordered[1:]):
         if upper >= BLOCK_BREAK_MIN_S and upper / lower >= BLOCK_BREAK_JUMP:
             return (lower * upper) ** 0.5
     return None
+
+
+def trim_line_ends(lines: list[Line], mask, hop_s: float) -> int:
+    """Pull each line's end back to where the singing under it actually stops (plus TRIM_PAD_S). Alignment can stretch
+    a line's end across a long pause or an instrumental stretch; the vocal track shows where the voice really stopped.
+    Only ever shortens. The singing counted is between the line's start and its end (or the next line's start, if
+    that is earlier), and stops at the first silence longer than TRIM_MAX_INNER_GAP_S. Returns how many ends moved.
+
+    A line followed by echo lines is different: the echo is sung right after it, so the aligner cannot tell where the
+    line stops and the echo starts (a held last note is shared out between them). There the end is simply where the
+    unbroken singing that starts with the line stops - a silence of TRIM_ECHO_GAP_S or more ends it - and it may be
+    moved later as well as earlier, but never past the next line's start."""
+    import numpy as np
+
+    m = np.asarray(mask, dtype=bool)
+    moved = 0
+    for i, l in enumerate(lines):
+        if l.start is None or l.end is None:
+            continue
+        nxt = next((o.start for o in lines[i + 1:] if o.start is not None), None)
+        echo = bool(l.echoes)
+        limit = (nxt if nxt is not None and nxt > l.start else len(m) * hop_s) if echo else l.end
+        if not echo and nxt is not None and l.start < nxt < limit:
+            limit = nxt
+        a, b = int(l.start / hop_s), int(limit / hop_s)
+        voiced = np.flatnonzero(m[a:b])
+        if voiced.size == 0:
+            continue
+        cut = np.flatnonzero(np.diff(voiced) * hop_s > (TRIM_ECHO_GAP_S if echo else TRIM_MAX_INNER_GAP_S))
+        last = voiced[cut[0]] if cut.size else voiced[-1]
+        new_end = round((a + int(last) + 1) * hop_s + TRIM_PAD_S, 3)
+        if nxt is not None and echo:
+            new_end = min(new_end, nxt)
+        if new_end < l.end - 0.05 or (echo and new_end > l.end + 0.05):
+            l.end = max(new_end, l.start)
+            for w in l.words:
+                w["end"] = min(w["end"], l.end)
+                w["start"] = min(w["start"], w["end"])
+            if l.words and l.end > l.words[-1]["end"]:
+                l.words[-1]["end"] = l.end
+            moved += 1
+    return moved
 
 
 def find_sung_blocks(mask, hop_s: float, min_gap_s: Optional[float] = None,
@@ -312,7 +392,71 @@ def _expects_break(line: Line) -> bool:
     return any(w in label.lower() for label in line.labels for w in INSTRUMENTAL_WORDS)
 
 
-def plan_blocks(lines: list[Line], blocks: list[tuple[float, float]]) -> list[list[int]]:
+def _norm_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower().replace("\u2019", "'"))
+
+
+def _same_word(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 4:
+        return False
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= EVIDENCE_FUZZY
+
+
+def match_evidence(lines: list[Line], transcripts: list[str]) -> Optional[list[list[int]]]:
+    """Which lyric lines were actually heard in which block, from a plain transcript of each block.
+
+    The transcripts (in block order) are lined up with the lyrics as one long in-order sequence match (longest common
+    subsequence of words, similar spellings count as equal), so a chorus sung three times is matched to its three
+    places in order. Echo lines are part of the lyric stream (they are sung) but count for the line before them.
+    Returns counts[block][line] = words of that line heard in that block, or None when nothing matched at all."""
+    lyr, owner = [], []
+    for i, l in enumerate(lines):
+        for w in _norm_words(l.text) + [w for e in l.echoes for w in _norm_words(e)]:
+            lyr.append(w)
+            owner.append(i)
+    heard, block_of = [], []
+    for k, t in enumerate(transcripts):
+        for w in _norm_words(t):
+            heard.append(w)
+            block_of.append(k)
+    if not lyr or not heard:
+        return None
+    n, m = len(lyr), len(heard)
+    eq: dict = {}
+
+    def same(a, b):
+        key = (a, b)
+        if key not in eq:
+            eq[key] = _same_word(a, b)
+        return eq[key]
+
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for a in range(1, n + 1):
+        row, prev = dp[a], dp[a - 1]
+        for b in range(1, m + 1):
+            best = prev[b] if prev[b] >= row[b - 1] else row[b - 1]
+            if prev[b - 1] + 1 > best and same(lyr[a - 1], heard[b - 1]):
+                best = prev[b - 1] + 1
+            row[b] = best
+    counts = [[0] * len(lines) for _ in transcripts]
+    a, b = n, m
+    while a > 0 and b > 0:
+        if dp[a][b] == dp[a - 1][b]:
+            a -= 1
+        elif dp[a][b] == dp[a][b - 1]:
+            b -= 1
+        else:
+            counts[block_of[b - 1]][owner[a - 1]] += 1
+            a -= 1
+            b -= 1
+    return counts if any(any(r) for r in counts) else None
+
+
+def plan_blocks(lines: list[Line], blocks: list[tuple[float, float]],
+                evidence: Optional[list[list[int]]] = None) -> list[list[int]]:
     """Decide which lyric lines belong to which block of singing.
 
     Lines stay in order and each block gets a run of consecutive lines (possibly none: ad-libs, backing vocals).
@@ -320,6 +464,10 @@ def plan_blocks(lines: list[Line], blocks: list[tuple[float, float]]) -> list[li
     pace is worked out from the song itself: total singing time / total words), preferring to cut where a new
     [section] starts - especially after an instrumental label like [Guitar Solo] - and where the user's own rough
     times (if given) agree. Returns one list of line indexes per block.
+
+    Block length is only a rough guide (a chant repeated at the end, a reprise that is not in the lyrics, or echo
+    lines that are sung but not timed make a section sing much longer than its words suggest). When `evidence` is
+    given (match_evidence: what was actually heard in each block) it decides instead, and length only breaks ties.
     """
     K, N = len(blocks), len(lines)
     if K == 0:
@@ -332,6 +480,14 @@ def plan_blocks(lines: list[Line], blocks: list[tuple[float, float]]) -> list[li
         prefix.append(prefix[-1] + w)
     dur = [e - s for s, e in blocks]
     rate = sum(dur) / prefix[N]  # seconds of singing per word
+    heard = None
+    if evidence is not None:
+        heard = []   # heard[k][i]: words heard in block k that belong to the lines before i (cumulative)
+        for k in range(K):
+            acc = [0]
+            for i in range(N):
+                acc.append(acc[-1] + evidence[k][i])
+            heard.append(acc)
 
     # misses[k][i]: lines before index i whose rough time falls outside block k (cumulative)
     misses = []
@@ -351,9 +507,13 @@ def plan_blocks(lines: list[Line], blocks: list[tuple[float, float]]) -> list[li
 
     def block_cost(k: int, j: int, i: int) -> float:
         if i == j:
-            return dur[k] + PLAN_SKIP_BLOCK_PENALTY
-        return (abs(dur[k] - rate * (prefix[i] - prefix[j])) + cut_cost(j)
-                + PLAN_HINT_MISS_PENALTY * (misses[k][i] - misses[k][j]))
+            return (0.0 if heard else dur[k]) + PLAN_SKIP_BLOCK_PENALTY
+        length_gap = abs(dur[k] - rate * (prefix[i] - prefix[j]))
+        if heard:
+            value = EVIDENCE_LENGTH_WEIGHT * length_gap - EVIDENCE_WEIGHT * (heard[k][i] - heard[k][j])
+        else:
+            value = length_gap
+        return value + cut_cost(j) + PLAN_HINT_MISS_PENALTY * (misses[k][i] - misses[k][j])
 
     INF = float("inf")
     dp = [[INF] * (N + 1) for _ in range(K + 1)]
@@ -478,7 +638,7 @@ def repair_failed(model, audio_path: str, lines: list[Line], language: str, say,
                     sum(1 for l in group if l.start is None)
                 try:
                     res = model.align(audio[int(lo * SAMPLE_RATE):int(hi * SAMPLE_RATE)],
-                                      "\n".join(l.text for l in group), language=language, original_split=True)
+                                      "\n".join(l.sung_text for l in group), language=language, original_split=True)
                     shifted = [SimpleNamespace(word=w.word, start=w.start + lo, end=w.end + lo,
                                                probability=getattr(w, "probability", None)) for w in res.all_words()]
                     map_words_to_lines(group, shifted)
@@ -507,7 +667,7 @@ def _align_group(model, audio, group: list[Line], lo: float, hi: float, language
     from whisper.audio import SAMPLE_RATE
 
     try:
-        res = model.align(audio[int(lo * SAMPLE_RATE):int(hi * SAMPLE_RATE)], "\n".join(l.text for l in group),
+        res = model.align(audio[int(lo * SAMPLE_RATE):int(hi * SAMPLE_RATE)], "\n".join(l.sung_text for l in group),
                           language=language, original_split=True)
         shifted = [SimpleNamespace(word=w.word, start=w.start + lo, end=w.end + lo,
                                    probability=getattr(w, "probability", None)) for w in res.all_words()]
@@ -515,6 +675,25 @@ def _align_group(model, audio, group: list[Line], lo: float, hi: float, language
     except Exception:
         return False
     return sum(_is_failed(l) for l in group) <= len(group) // 2
+
+
+def _transcribe_blocks(model, audio, blocks, language: str, say) -> Optional[list[str]]:
+    """Plain speech-to-text of each block of singing: evidence of which lyrics are where. Best effort - None when the
+    model cannot transcribe (the plan then falls back to block lengths)."""
+    from whisper.audio import SAMPLE_RATE
+
+    texts = []
+    try:
+        for k, (b_start, b_end) in enumerate(blocks):
+            say(f"Listening to stretch {k + 1} of {len(blocks)} to see which lyrics it holds...")
+            a, b = int(max(0.0, b_start - BLOCK_PAD_S) * SAMPLE_RATE), int((b_end + BLOCK_PAD_S) * SAMPLE_RATE)
+            res = model.transcribe(audio[a:b], language=language, verbose=None, condition_on_previous_text=False,
+                                   fp16=False)
+            texts.append(getattr(res, "text", "") or "")
+    except Exception as exc:
+        say(f"  (could not transcribe the singing, using block lengths instead: {str(exc)[:80]})")
+        return None
+    return texts
 
 
 def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium", device: str = "cuda",
@@ -541,7 +720,9 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     total = len(audio) / SAMPLE_RATE
     mask, hop_s = voiced_mask(audio, SAMPLE_RATE)
     runs = _sound_runs(mask, hop_s)
-    break_s = choose_gap_threshold([b[0] - a[1] for a, b in zip(runs, runs[1:])])
+    pauses = [b[0] - a[1] for a, b in zip(runs, runs[1:])]
+    break_s = choose_gap_threshold(pauses)
+    clear_breaks = _jump_threshold(pauses) is not None   # False: breaks found only by the plain 5 s minimum
     blocks = find_sung_blocks(mask, hop_s)
     info: dict = {"mode": "whole song", "blocks": [],
                   "break_length_s": None if break_s is None else round(break_s, 1)}  # pauses longer than this split the singing
@@ -550,7 +731,16 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     if len(blocks) >= 2:
         info["mode"] = "singing blocks"
         say(f"Found {len(blocks)} stretches of singing; matching lyric sections to them...")
-        plan = plan_blocks(lines, blocks)
+        evidence = None
+        if not clear_breaks:
+            # The breaks did not stand out clearly (pauses grow gradually), so block lengths are a weak guide to which
+            # section is where: listen to each block and see which lyrics it actually holds. Songs whose breaks do
+            # stand out keep the length-based pairing, which has worked on every song tried so far.
+            heard_text = _transcribe_blocks(model, audio, blocks, language, say)
+            if heard_text:
+                evidence = match_evidence(lines, heard_text)
+                info["evidence"] = "transcript" if evidence else "none"
+        plan = plan_blocks(lines, blocks, evidence)
         fits = block_fit(lines, blocks, plan)
         for k, ((b_start, b_end), idxs) in enumerate(zip(blocks, plan)):
             info["blocks"].append({"start": round(b_start, 2), "end": round(b_end, 2),
@@ -570,12 +760,13 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
                 estimated.update(idxs)
     else:
         say("Aligning lyrics to vocals...")
-        result = model.align(str(vocals_path), "\n".join(l.text for l in lines), language=language,
+        result = model.align(str(vocals_path), "\n".join(l.sung_text for l in lines), language=language,
                              original_split=True)
         map_words_to_lines(lines, list(result.all_words()))
 
     flag_lines(lines)
     repaired, mask, hop_s = repair_failed(model, str(vocals_path), lines, language, say, audio=audio)
+    info["lines_trimmed"] = trim_line_ends(lines, mask, hop_s)  # before the final flags, so "very long" means still long
     flag_lines(lines)
     for i, l in enumerate(lines):
         if l.start is not None and voiced_fraction(mask, hop_s, l.start, l.end) < VOICED_MIN_FRACTION:

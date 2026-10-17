@@ -160,7 +160,7 @@ def _pipeline(audio: Path, lyrics_text: str, output_dir: Path, model: str, devic
         "lrc": output_dir / f"{stem}.lrc",
         "json": output_dir / f"{stem}_timing.json",
     }
-    timed_text = lc.to_timed_text(lines, title, duration, blocks=found["blocks"])
+    timed_text = lc.to_timed_text(lines, title, duration, blocks=found["blocks"], mode=found["mode"])
     files["timed"].write_text(timed_text, encoding="utf-8")
     files["lrc"].write_text(lc.to_lrc(lines, words=words), encoding="utf-8")
     files["json"].write_text(lc.to_json(lines, meta), encoding="utf-8")

@@ -120,6 +120,31 @@ def test_rough_times_and_non_lyric_lines_still_parse():
     assert [(l.text, l.hint) for l in lines] == [("first line", 12.0), ("second line", 65.0)]
 
 
+def test_echo_lines_in_parentheses_belong_to_the_line_before_and_are_not_timed():
+    lines = lc.parse_lyrics("[Chorus]\nWho is next\n(Who is next?)\n(Who is next?)\nSweet face\n[Verse 2]\nA new day\n")
+    assert [l.text for l in lines] == ["Who is next", "Sweet face", "A new day"]
+    assert lines[0].echoes == ["Who is next?", "Who is next?"] and lines[1].echoes == []
+    assert lines[1].section is None and lines[1].labels == []      # the echo is not mistaken for a section label
+    assert lines[2].section == "Verse 2"
+
+
+def test_echo_words_are_aligned_with_the_line_but_not_reported_as_part_of_it():
+    lines = lc.parse_lyrics("[V]\nWho is next\n(Who is next?)\nSweet face\n")
+    assert lines[0].sung_text == "Who is next Who is next?" and lines[1].sung_text == "Sweet face"
+    toks = "Who is next Who is next? Sweet face".split()
+    words = [SimpleNamespace(word=w, start=float(i), end=i + 0.5, probability=0.9) for i, w in enumerate(toks)]
+    lc.map_words_to_lines(lines, words)
+    assert [w["word"] for w in lines[0].words] == ["Who", "is", "next"]        # the echo's words are dropped...
+    assert lines[0].end == 2.5                                                   # ...so the line ends where it is sung
+    assert [w["word"] for w in lines[1].words] == ["Sweet", "face"] and lines[1].start == 6.0
+
+
+def test_parenthesised_section_names_are_still_labels_and_a_leading_echo_is_dropped():
+    lines = lc.parse_lyrics("(echo before anything)\n(Chorus)\nla la\n(Guitar Solo)\nda da\n")
+    assert lines[0].labels == ["Chorus"] and lines[0].echoes == []
+    assert lines[1].labels == ["Guitar Solo"] and lc._expects_break(lines[1])
+
+
 # ----------------------------------------------------------------------------------------------- finding the singing
 
 def _mask(runs, total_s, hop=0.02):
@@ -157,11 +182,153 @@ def test_break_length_comes_from_the_songs_own_pauses_not_a_fixed_number():
 def test_break_length_edge_cases():
     assert lc.choose_gap_threshold([]) is None
     assert lc.choose_gap_threshold([2.8, 3.1, 3.0, 2.9]) is None            # only ordinary pauses: no break at all
-    assert lc.choose_gap_threshold([3.0, 3.6, 4.3, 5.2, 6.3, 7.6]) is None  # a smooth continuum: nothing stands out
+    # a smooth continuum has no jump, but pauses of 5 s or more are still breaks (Daylight Monster, below)
+    assert lc.choose_gap_threshold([3.0, 3.6, 4.3, 5.2, 6.3, 7.6]) == lc.BLOCK_BREAK_MIN_S
+    assert lc.choose_gap_threshold([3.0, 3.6, 4.3, 4.9]) is None             # ...but nothing reaches 5 s: no break
     assert lc.choose_gap_threshold([0.3, 0.5, 0.8]) is None                  # micro-pauses are ignored
     assert 1.0 < lc.choose_gap_threshold([8.0]) < 8.0                        # a single long break splits the song
     both = lc.choose_gap_threshold([8.0, 10.0])                              # a song where every pause is a break
     assert both is not None and both < 8.0
+
+
+DAYLIGHT_PAUSES = [1.1, 1.4, 1.9, 2.2, 2.6, 2.6, 3.3, 4.3, 6.3, 10.0, 10.4]   # pauses >= 1 s from "Daylight Monster"
+
+
+def test_pauses_that_grow_gradually_still_split_at_five_seconds():
+    # 6.3/4.3 = 1.47 and 10.0/6.3 = 1.59 are both under the 1.6 jump rule, so the jump rule alone finds nothing
+    ordered = [1.0] + sorted(DAYLIGHT_PAUSES)
+    assert not any(u >= lc.BLOCK_BREAK_MIN_S and u / l >= lc.BLOCK_BREAK_JUMP for l, u in zip(ordered, ordered[1:]))
+    assert lc.choose_gap_threshold(DAYLIGHT_PAUSES) == lc.BLOCK_BREAK_MIN_S
+    runs, t = [], 0.0
+    for g in [0.0] + DAYLIGHT_PAUSES:   # one 3 s stretch of singing after each pause
+        t += g
+        runs.append((t, t + 3.0))
+        t += 3.0
+    blocks = lc.find_sung_blocks(_mask(runs, t + 1), 0.02)
+    assert len(blocks) == 4   # split at the 6.3, 10.0 and 10.4 s pauses; the 4.3 s one is an ordinary pause
+
+
+def test_the_jump_rule_still_wins_when_it_finds_a_break():
+    gaps = [2.0, 2.4, 2.6, 3.0, 9.0]
+    assert 3.0 < lc.choose_gap_threshold(gaps) < 9.0 and lc.choose_gap_threshold(gaps) != lc.BLOCK_BREAK_MIN_S
+
+
+def test_line_ends_are_pulled_back_to_where_the_singing_stops():
+    mask = _mask([(10.0, 14.0), (14.8, 18.0)], 40.0)   # singing 10-18 s, silence after
+    line = lc.Line(0, "a b", start=10.0, end=35.0, words=[
+        {"word": "a", "start": 10.0, "end": 12.0, "probability": 0.9}, {"word": "b", "start": 12.0, "end": 35.0, "probability": 0.9}])
+    assert lc.trim_line_ends([line], mask, 0.02) == 1
+    assert abs(line.end - 18.2) < 0.05, line.end          # last voiced frame + 0.2 s pad
+    assert abs(line.words[-1]["end"] - line.end) < 1e-6 and line.words[0]["end"] == 12.0
+
+
+def test_a_line_followed_by_echoes_ends_where_its_unbroken_singing_ends():
+    # singing 118-124.2, a 4 s silence, then the echo at 128-133 (as in "Daylight Monster" chorus 1)
+    mask = _mask([(118.0, 124.2), (128.0, 133.0)], 140.0)
+    nxt = lc.Line(1, "next verse", start=143.0, end=147.0)
+    for aligned_end in (121.0, 133.0):   # the aligner may end it early (held note shared with the echo) or late
+        line = lc.Line(0, "Who will he see next", start=118.0, end=aligned_end, echoes=["Who will he see next?"],
+                       words=[{"word": "next", "start": 120.0, "end": aligned_end, "probability": 0.5}])
+        lc.trim_line_ends([line, nxt], mask, 0.02)
+        assert abs(line.end - 124.4) < 0.05, (aligned_end, line.end)
+        assert line.words[-1]["end"] == line.end
+    plain = lc.Line(0, "Who will he see next", start=118.0, end=121.0)   # no echoes: only ever shortened
+    lc.trim_line_ends([plain, nxt], mask, 0.02)
+    assert plain.end == 121.0
+
+
+def test_an_echo_line_never_runs_into_the_next_line():
+    mask = _mask([(10.0, 13.0), (13.5, 20.0)], 30.0)   # the echo-bearing line is followed straight away by the next one
+    a = lc.Line(0, "x", start=10.0, end=12.0, echoes=["x"])
+    b = lc.Line(1, "y", start=13.5, end=20.0)
+    lc.trim_line_ends([a, b], mask, 0.02)
+    assert a.end <= 13.5 and b.start == 13.5
+
+
+def test_trimming_never_reaches_into_the_next_lines_singing_or_across_a_long_silence():
+    mask = _mask([(10.0, 14.0), (30.0, 34.0)], 40.0)    # a 16 s silence, then the next section
+    a = lc.Line(0, "x", start=10.0, end=33.0)
+    b = lc.Line(1, "y", start=30.0, end=34.0)
+    lc.trim_line_ends([a, b], mask, 0.02)
+    assert abs(a.end - 14.2) < 0.05, a.end                # not 33: the singing at 30+ belongs to the next line
+    assert b.start == 30.0 and b.end == 34.0              # a line that already ends with the singing is left alone
+    c = lc.Line(0, "z", start=10.0, end=40.0)
+    lc.trim_line_ends([c], mask, 0.02)
+    assert abs(c.end - 14.2) < 0.05, c.end                # no next line: still stops at the silence
+
+
+def test_trimming_only_shortens_and_leaves_odd_lines_alone():
+    mask = _mask([(10.0, 14.0)], 40.0)
+    short = lc.Line(0, "x", start=10.0, end=12.0)
+    nothing = lc.Line(1, "y", start=20.0, end=25.0)       # no singing under it at all
+    unaligned = lc.Line(2, "z")
+    assert lc.trim_line_ends([short, nothing, unaligned], mask, 0.02) == 0
+    assert short.end == 12.0 and nothing.end == 25.0 and unaligned.end is None
+
+
+def test_a_trimmed_line_is_no_longer_flagged_very_long():
+    mask = _mask([(10.0, 14.0)], 60.0)
+    line = lc.Line(0, "x", start=10.0, end=50.0, confidence=0.9)
+    lc.flag_lines([line])
+    assert any("very long" in f for f in line.flags)
+    lc.trim_line_ends([line], mask, 0.02)
+    lc.flag_lines([line])
+    assert not any("very long" in f for f in line.flags)
+
+
+def test_the_summary_header_says_which_path_was_used():
+    line = lc.Line(0, "x", start=1.0, end=2.0)
+    assert "Alignment: whole song" in lc.to_timed_text([line], "t", 10.0, mode="whole song")
+    assert "Alignment: singing blocks" in lc.to_timed_text([line], "t", 10.0, mode="singing blocks")
+    assert "Alignment:" not in lc.to_timed_text([line], "t", 10.0)
+
+
+# ----------------------------------------------------------------------------------------------- what was heard where
+
+EV_LYRICS = """[Verse]
+he walks to the park
+he sees a small cat
+[Chorus]
+who is next tonight
+sweet face black breath
+[Bridge]
+a mom with a stroller
+tiny hands folded sleep
+"""
+# Real shape of "Daylight Monster": the middle block sings the chorus twice as long as its words, and a last block
+# repeats the first verse (not in the lyrics at all), so block lengths alone cannot pair sections with blocks.
+EV_BLOCKS = [(10.0, 40.0), (50.0, 120.0), (130.0, 140.0), (150.0, 200.0)]
+EV_HEARD = ["He walks to the park. He sees a small cat. Who is next tonight? Sweet face, black breath.",
+            "Who is next tonight? Who is next tonight? Who is next tonight? Sweet face black breath.",
+            "A mom with a stroller. Tiny hands, folded sleep.",
+            "He walks to the park. He sees a small cat."]
+
+
+def test_what_was_heard_in_each_block_decides_which_lyrics_it_holds():
+    lines = lc.parse_lyrics(EV_LYRICS)
+    ev = lc.match_evidence(lines, EV_HEARD)
+    assert ev is not None and len(ev) == 4 and len(ev[0]) == 6
+    plan = lc.plan_blocks(lines, EV_BLOCKS, ev)
+    assert plan[2] == [4, 5] and plan[3] == []                    # the bridge block; the reprise block gets no lyrics
+    assert plan[0] + plan[1] == [0, 1, 2, 3]                      # verse and chorus come first, in order
+
+
+def test_without_evidence_the_plan_is_decided_by_block_lengths_as_before():
+    lines = lc.parse_lyrics(EV_LYRICS)
+    assert lc.plan_blocks(lines, EV_BLOCKS) == lc.plan_blocks(lines, EV_BLOCKS, None)
+    assert lc.match_evidence(lines, ["", ""]) is None                            # nothing heard: no evidence
+    assert lc.match_evidence(lines, ["completely unrelated words here"]) is None
+
+
+def test_similar_spellings_count_as_the_same_word():
+    lines = lc.parse_lyrics("[V]\nPressed shirt clean shoes\n")
+    assert lc.match_evidence(lines, ["Press shirt, clean shoe."]) == [[4]]
+
+
+def test_a_model_that_cannot_transcribe_falls_back_to_block_lengths():
+    said = []
+    assert lc._transcribe_blocks(object(), np.zeros(16000 * 5, dtype="float32"), [(1.0, 3.0)], "en", said.append) is None
+    assert any("block lengths" in m for m in said)
 
 
 def test_a_slow_song_whose_line_pauses_look_like_breaks_is_not_chopped_into_lines():

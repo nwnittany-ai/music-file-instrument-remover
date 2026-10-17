@@ -109,7 +109,8 @@ python lyricsync.py "song.mp3" lyrics.txt --vocals "song_vocals.wav"   # reuse a
 
 It separates the vocals with Demucs, then force-aligns the lyrics to them with stable-ts (Whisper
 `medium` by default; `--model large-v3` for harder songs). Lyrics format: one sung line per line;
-`[Section]` labels, a `[title] ...` line and lines with no letters are skipped; an optional leading
+`[Section]` labels, a `[title] ...` line and lines with no letters are skipped (so are echo lines written
+in parentheses, such as `(Who will he see next?)` - they are not timed); an optional leading
 `m:ss` on a line is treated as a rough time and used as a cross-check. Outputs, next to the song
 (or in `--output-dir`): `<song>_timed.txt` (paste into Claude chat), `<song>.lrc`, and
 `<song>_timing.json` (always includes per-word times and confidence). Lines the aligner gave up on
@@ -129,6 +130,16 @@ and which lines went with it, and warns when a stretch is much longer or shorter
 the pairing may be wrong). A stretch the aligner cannot place is spread over the singing by word count and flagged
 `estimated`. Songs with no clear gaps are aligned in one pass, as before. Sung words score low on Whisper's confidence
 even when placed correctly, so a line is only marked `!` below 0.3.
+When the pauses grow gradually instead of jumping (no clear break, e.g. 4.3, 6.3, 10.0, 10.4 s), every pause of
+5 s or more is still treated as a break. Because block lengths are a weak guide in that case (a chorus chanted longer
+than its words, a reprise that is not in the lyrics), the tool first listens to each stretch (a plain Whisper
+transcript) and pairs sections with the stretches by which lyric words were actually heard in each; a stretch that
+holds none of the lyrics gets none. After aligning, each line's end is pulled back to where the singing under it
+really stops (alignment can stretch an end across a long pause). The header says which path was used
+(`Alignment: singing blocks` or `whole song`).
+Echo lines written in parentheses, such as `(Who will he see next?)`, are not timed: they are sung, so they are given
+to the aligner with the line before them (so a held last note is not shared out wrongly), but they get no line of
+their own in the output.
 Tests (no pytest or model needed): `.venv\Scripts\python.exe tests\test_lyricsync.py`.
 
 The GUI has the same thing as the **Lyric Timing** tab (paste lyrics, pick a song, copy the result).
