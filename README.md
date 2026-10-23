@@ -110,7 +110,9 @@ python lyricsync.py "song.mp3" lyrics.txt --vocals "song_vocals.wav"   # reuse a
 It separates the vocals with Demucs, then force-aligns the lyrics to them with stable-ts (Whisper
 `medium` by default; `--model large-v3` for harder songs). Lyrics format: one sung line per line;
 `[Section]` labels, a `[title] ...` line and lines with no letters are skipped (so are echo lines written
-in parentheses, such as `(Who will he see next?)` - they are not timed); an optional leading
+in parentheses, such as `(Who will he see next?)` - they are not timed). A line of only punctuation such as `...`
+or `----` is a rest marker: it is not timed either, but it tells the tool the singer pauses there, so a stretch of
+singing may end at that point (see below); an optional leading
 `m:ss` on a line is treated as a rough time and used as a cross-check. Outputs, next to the song
 (or in `--output-dir`): `<song>_timed.txt` (paste into Claude chat), `<song>.lrc`, and
 `<song>_timing.json` (always includes per-word times and confidence). Lines the aligner gave up on
@@ -121,21 +123,27 @@ All logic is in `lyricsync_core.py`.
 separated by instrumental breaks (a silent intro, a fill, a guitar solo). What counts as a break is measured from
 the song itself: the pauses between sung lines are all about the same length (2-3.3 s in the songs tried so far) and
 breaks are much longer, so the cut-off is placed where the pauses jump in length (a fixed 3 s rule chopped a slow
-song's verses into line-sized pieces). It then matches your lyric sections to
-those stretches - by how long each stretch is compared with how many words the section has, preferring to split
+song's verses into line-sized pieces). It then matches your lyric lines to
+those stretches - mainly by which lyric words were actually heard in each stretch (see below), with the stretch's length
+compared with how many words the lines have as a tie-breaker, preferring to split
 where a new `[Section]` starts (especially after a label such as `[Guitar Solo]`, `[Guitar Fill]` or `[Intro]`,
-which signal a break) and where your own rough times agree - and aligns each section inside its own stretch, so the
+which signal a break) or after a rest marker (`...`), and where your own rough times agree - and aligns each group of lines inside its own stretch, so the
 speech model never has to cross a long instrumental part. The `_timed.txt` header lists where the singing was found
 and which lines went with it, and warns when a stretch is much longer or shorter than its lines should take (a sign
 the pairing may be wrong). A stretch the aligner cannot place is spread over the singing by word count and flagged
 `estimated`. Songs with no clear gaps are aligned in one pass, as before. Sung words score low on Whisper's confidence
 even when placed correctly, so a line is only marked `!` below 0.3.
 When the pauses grow gradually instead of jumping (no clear break, e.g. 4.3, 6.3, 10.0, 10.4 s), every pause of
-5 s or more is still treated as a break. Because block lengths are a weak guide in that case (a chorus chanted longer
-than its words, a reprise that is not in the lyrics), the tool first listens to each stretch (a plain Whisper
-transcript) and pairs sections with the stretches by which lyric words were actually heard in each; a stretch that
-holds none of the lyrics gets none. After aligning, each line's end is pulled back to where the singing under it
-really stops (alignment can stretch an end across a long pause). The header says which path was used
+5 s or more is still treated as a break. Block lengths are only a weak guide to which lines are where (a chorus
+chanted longer than its words, a reprise that is not in the lyrics, held notes and rests that make the pace very
+uneven), and even clear-looking breaks can be paired wrongly by length alone, so the tool always listens to each
+stretch first (a plain Whisper transcript, about half a minute on the GPU) and pairs lines with the stretches by which
+lyric words were actually heard in each; a stretch that holds none of the lyrics gets none. If the model cannot
+transcribe, it falls back to block lengths. After aligning, three corrections use the vocal track's loudness: each
+line's end is pulled back to where the singing under it really stops (alignment can stretch an end across a long
+pause); a line whose first word was stretched back across silence has its start moved to where the sound begins; and
+a held word the aligner collapsed to a sliver (`time.....` sung for four seconds) is stretched over its note, never
+into the neighbouring lines, and marked `held note`. The header says which path was used
 (`Alignment: singing blocks` or `whole song`).
 Echo lines written in parentheses, such as `(Who will he see next?)`, are not timed: they are sung, so they are given
 to the aligner with the line before them (so a held last note is not shared out wrongly), but they get no line of

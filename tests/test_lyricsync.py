@@ -120,6 +120,13 @@ def test_rough_times_and_non_lyric_lines_still_parse():
     assert [(l.text, l.hint) for l in lines] == [("first line", 12.0), ("second line", 65.0)]
 
 
+def test_a_rest_marker_line_is_remembered_by_the_line_after_it():
+    lines = lc.parse_lyrics("[Chorus]\ntime.....\n....and space...\n....\ntime.....\n----\n....and space...\n")
+    assert [l.rest_before for l in lines] == [False, False, True, True]
+    assert lc.parse_lyrics("...\n[V]\nfirst\n\nsecond\n")[0].rest_before is False      # a rest before the first line is the intro
+    assert [l.rest_before for l in lc.parse_lyrics("first\n\nsecond\n")] == [False, False]   # a blank line is not a marker
+
+
 def test_echo_lines_in_parentheses_belong_to_the_line_before_and_are_not_timed():
     lines = lc.parse_lyrics("[Chorus]\nWho is next\n(Who is next?)\n(Who is next?)\nSweet face\n[Verse 2]\nA new day\n")
     assert [l.text for l in lines] == ["Who is next", "Sweet face", "A new day"]
@@ -276,6 +283,50 @@ def test_a_trimmed_line_is_no_longer_flagged_very_long():
     assert not any("very long" in f for f in line.flags)
 
 
+def test_a_line_that_starts_in_silence_is_moved_to_where_the_sound_begins():
+    mask = _mask([(10.0, 14.0), (20.0, 24.0)], 40.0)
+    # the aligner stretched "we" back across the 6 s of silence between the two phrases
+    words = [{"word": "we", "start": 14.0, "end": 20.0, "probability": 0.5}, {"word": "go", "start": 20.0, "end": 24.0, "probability": 0.9}]
+    line = lc.Line(0, "we go", start=14.0, end=24.0, words=words)
+    assert lc.snap_line_starts([line], mask, 0.02) == 1
+    assert abs(line.start - 19.9) < 0.05 and line.end == 24.0, line.start
+    assert line.words[0]["start"] == line.start and line.words[0]["end"] == 20.0 and line.words[1]["start"] == 20.0
+
+
+def test_starts_already_on_the_sound_or_on_a_stray_tail_are_left_alone():
+    mask = _mask([(10.0, 14.0), (14.3, 14.45), (20.0, 24.0)], 40.0)    # a 0.15 s blip of tail just after the first phrase
+    on_sound = lc.Line(0, "a", start=11.0, end=13.0)
+    after_tail = lc.Line(1, "b", start=14.3, end=24.0)                  # starts in the tail: the sustained sound is at 20
+    nothing = lc.Line(2, "c", start=30.0, end=35.0)                      # no sound anywhere under it
+    unaligned = lc.Line(3, "d")
+    assert lc.snap_line_starts([on_sound, nothing, unaligned], mask, 0.02) == 0
+    assert on_sound.start == 11.0 and nothing.start == 30.0
+    assert lc.snap_line_starts([after_tail], mask, 0.02) == 1 and abs(after_tail.start - 19.9) < 0.05
+
+
+def test_a_held_word_that_came_back_as_a_sliver_is_stretched_over_its_note():
+    mask = _mask([(100.0, 112.0)], 130.0)            # one long sustained note, 100-112 s
+    prev = lc.Line(0, "before", start=90.0, end=96.0, confidence=0.9)
+    held = lc.Line(1, "time.....", start=105.0, end=105.0, confidence=0.002, words=[
+        {"word": "time.....", "start": 105.0, "end": 105.0, "probability": 0.002}])
+    nxt = lc.Line(2, "and space", start=108.0, end=111.0, confidence=0.5)
+    assert lc.stretch_held_lines([prev, held, nxt], mask, 0.02) == [1]
+    assert abs(held.start - 100.0) < 0.05 and abs(held.end - 108.0) < 0.05          # note start .. next line's start
+    assert held.words[0]["start"] == held.start and held.words[0]["end"] == held.end
+    assert prev.end == 96.0 and nxt.start == 108.0                                   # neighbours and confident lines untouched
+
+
+def test_a_held_note_never_reaches_back_into_the_previous_line():
+    mask = _mask([(100.0, 130.0)], 140.0)             # unbroken sound under two lines
+    prev = lc.Line(0, "every day", start=100.0, end=116.8, confidence=0.9)
+    held = lc.Line(1, "time", start=123.0, end=123.0, confidence=0.01)
+    nxt = lc.Line(2, "and space", start=125.0, end=129.0, confidence=0.5)
+    lc.stretch_held_lines([prev, held, nxt], mask, 0.02)
+    assert held.start >= 116.8 - 1e-6 and abs(held.end - 125.0) < 0.05, (held.start, held.end)
+    nobody = lc.Line(0, "x", start=50.0, end=50.0, confidence=0.0)                   # held-looking, but silent: nothing to stretch to
+    assert lc.stretch_held_lines([nobody], mask, 0.02) == [] and (nobody.start, nobody.end) == (50.0, 50.0)
+
+
 def test_the_summary_header_says_which_path_was_used():
     line = lc.Line(0, "x", start=1.0, end=2.0)
     assert "Alignment: whole song" in lc.to_timed_text([line], "t", 10.0, mode="whole song")
@@ -318,6 +369,20 @@ def test_without_evidence_the_plan_is_decided_by_block_lengths_as_before():
     assert lc.plan_blocks(lines, EV_BLOCKS) == lc.plan_blocks(lines, EV_BLOCKS, None)
     assert lc.match_evidence(lines, ["", ""]) is None                            # nothing heard: no evidence
     assert lc.match_evidence(lines, ["completely unrelated words here"]) is None
+
+
+REST_LYRICS = "[Chorus]\ntime\nand space\n...\ntime\nand space\n"
+
+
+def test_a_rest_the_user_wrote_is_a_good_place_to_split_between_blocks():
+    # "time" is held and never heard, so the evidence ties between cutting before line 3 or before line 4; block
+    # lengths favour 3+1. Without the "..." the 3+1 split wins; with it, the cut goes where the singer rests.
+    blocks = [(0.0, 9.0), (20.0, 23.0)]
+    heard = ["time and space", "and space"]
+    plain = lc.parse_lyrics("[Chorus]\ntime\nand space\ntime\nand space\n")
+    assert lc.plan_blocks(plain, blocks, lc.match_evidence(plain, heard)) == [[0, 1, 2], [3]]
+    rested = lc.parse_lyrics(REST_LYRICS)
+    assert lc.plan_blocks(rested, blocks, lc.match_evidence(rested, heard)) == [[0, 1], [2, 3]]
 
 
 def test_similar_spellings_count_as_the_same_word():
@@ -440,6 +505,35 @@ def test_each_section_is_aligned_inside_its_own_block():
         assert [l.start for l in lines] == sorted(l.start for l in lines)
         assert not any(lc.ESTIMATE_FLAG in l.flags for l in lines)
         assert all(c[0] == "slice" for c in model.calls[:3]), "each block is aligned on its own slice of audio"
+
+
+class ListeningModel(FakeModel):
+    """FakeModel that can also transcribe: returns the given texts, one per call (blocks are listened to in order)."""
+
+    def __init__(self, texts):
+        super().__init__()
+        self._texts = list(texts)
+
+    def transcribe(self, audio, **kw):
+        return SimpleNamespace(text=self._texts.pop(0))
+
+
+def test_the_singing_is_listened_to_even_when_the_breaks_are_clear():
+    """The failure from "Time and Space": clear breaks used to skip listening, and block lengths alone paired the
+    lyrics with the wrong stretches of singing. What was heard now decides, however clear the breaks look."""
+    lyr = [f"w{3 * i + 1} w{3 * i + 2} w{3 * i + 3}" for i in range(12)]
+    heard = [" ".join(lyr[0:6]), " ".join(lyr[6:9]), " ".join(lyr[9:12])]     # 6 + 3 + 3 lines, in three equal blocks
+    with tempfile.TemporaryDirectory() as d:
+        wav = _song(BURSTS, 56.0, Path(d) / "voc.wav")
+        text = "[Song]\n" + "\n".join(lyr) + "\n"
+        lines = lc.parse_lyrics(text)
+        with patched_model(ListeningModel(heard)):
+            info = lc.align_vocals(wav, lines, model_name="x", device="cpu")
+        assert info["evidence"] == "transcript"
+        assert [(b["first_line"], b["last_line"]) for b in info["blocks"]] == [(1, 6), (7, 9), (10, 12)]   # lengths alone say 4+4+4
+        with patched_model(FakeModel()):   # a model that cannot listen still falls back to lengths
+            fallback = lc.align_vocals(wav, lc.parse_lyrics(text), model_name="x", device="cpu")
+        assert [(b["first_line"], b["last_line"]) for b in fallback["blocks"]] == [(1, 4), (5, 8), (9, 12)]
 
 
 def test_a_block_the_aligner_cannot_place_is_spread_over_the_singing_and_flagged():

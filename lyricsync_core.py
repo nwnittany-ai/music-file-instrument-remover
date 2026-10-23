@@ -49,6 +49,11 @@ EVIDENCE_WEIGHT = 3.0          # seconds-equivalent value of one lyric word hear
 EVIDENCE_LENGTH_WEIGHT = 0.1   # with that evidence, block length is only a tie-breaker
 EVIDENCE_FUZZY = 0.75          # two words this similar (difflib ratio) count as the same when matching a transcript
 TRIM_ECHO_GAP_S = 2.0          # for a line followed by echo lines: a silence this long ends the line (the echo is next)
+SNAP_LEAD_MIN_S = 0.6          # a line whose first stretch is this long without singing is moved to where the sound starts
+SNAP_PAD_S = 0.1               # ...a little before the first sustained sound
+SNAP_WINDOW_S = 0.6            # "sustained sound" = most of this window is voiced...
+SNAP_DENSITY = 0.6             # ...i.e. at least this fraction of it
+HELD_BRIDGE_S = 0.3            # a held word's sound may have dips this short (breath, vibrato) and still be one note
 ESTIMATE_FLAG ="estimated: spread over the singing block by word count (alignment failed here)"
 
 
@@ -70,6 +75,7 @@ class Line:
     repaired: bool = False             # re-timed by the second pass (kept out of flags: it passed the checks)
     labels: list = field(default_factory=list)  # every [label] between the previous sung line and this one
     echoes: list = field(default_factory=list)  # "(echo)" lines written right after this line: sung, but not timed
+    rest_before: bool = False          # a rest marker line ("...", "----") sits just before this line in the lyrics
 
     @property
     def sung_text(self) -> str:
@@ -94,9 +100,11 @@ def _is_section_name(label: str) -> bool:
 def parse_lyrics(text: str) -> list[Line]:
     """Sung lines only. [Section] labels are attached to the line that follows them, a [title] line
     is skipped, lines with no letters (e.g. "...") are skipped, and a leading "m:ss " on a line is
-    kept as a rough-time hint (not part of the sung text)."""
+    kept as a rough-time hint (not part of the sung text). A line of only punctuation ("...", "----") is a rest
+    marker: it is not sung, but the next sung line is remembered as starting after a rest (Line.rest_before)."""
     lines: list[Line] = []
     pending_labels: list[str] = []
+    pending_rest = False
     for raw in text.splitlines():
         s = raw.strip()
         if not s or TITLE_RE.match(s):
@@ -115,10 +123,12 @@ def parse_lyrics(text: str) -> list[Line]:
             hint = int(m.group(1)) * 60 + float(m.group(2))
             s = s[m.end():].strip()
         if not any(c.isalpha() for c in s):
+            pending_rest = pending_rest or bool(lines)   # a rest before the first line is just the intro
             continue
         lines.append(Line(len(lines), s, section=pending_labels[-1] if pending_labels else None, hint=hint,
-                          labels=list(pending_labels)))
+                          labels=list(pending_labels), rest_before=pending_rest))
         pending_labels = []
+        pending_rest = False
     if not lines:
         raise LyricSyncError("The lyrics file has no sung lines.")
     return lines
@@ -366,6 +376,97 @@ def trim_line_ends(lines: list[Line], mask, hop_s: float) -> int:
     return moved
 
 
+def _first_onset(m, hop_s: float, t0: float, t1: float) -> Optional[float]:
+    """Time of the first sustained start of singing in [t0, t1): a voiced frame followed by a window that is mostly
+    voiced. A stray tail of the previous line's sound (a few frames) does not count. None when there is none."""
+    import numpy as np
+
+    w = max(1, int(SNAP_WINDOW_S / hop_s))
+    cum = np.concatenate(([0], np.cumsum(np.asarray(m, dtype=np.int64))))
+    a, b = max(0, int(t0 / hop_s)), min(len(m), int(t1 / hop_s))
+    for i in range(a, b):
+        if m[i] and (cum[min(i + w, len(m))] - cum[i]) >= SNAP_DENSITY * w:
+            return i * hop_s
+    return None
+
+
+def snap_line_starts(lines: list[Line], mask, hop_s: float) -> int:
+    """Move a line's start forward to where its sound begins. The aligner tends to stretch a line's first word back
+    across the silence before it ("we" spanning 2 s of nothing), so the line looks like it starts long before anyone
+    sings. If the first SNAP_LEAD_MIN_S of a line is silent in the vocal track and singing starts later inside the
+    line, the start moves there (less SNAP_PAD_S). Only ever moves a start later. Returns how many were moved."""
+    import numpy as np
+
+    m = np.asarray(mask, dtype=bool)
+    moved = 0
+    for l in lines:
+        if l.start is None or l.end is None:
+            continue
+        if voiced_fraction(m, hop_s, l.start, l.start + SNAP_LEAD_MIN_S) >= SNAP_DENSITY:
+            continue   # already on the sound
+        onset = _first_onset(m, hop_s, l.start, l.end)
+        if onset is None or onset - l.start < SNAP_LEAD_MIN_S:
+            continue
+        new_start = round(min(onset - SNAP_PAD_S, l.end), 3)
+        if new_start <= l.start:
+            continue
+        l.start = new_start
+        for w in l.words:
+            if w["start"] < new_start:
+                w["start"] = new_start
+                w["end"] = max(w["end"], new_start)
+        moved += 1
+    return moved
+
+
+def stretch_held_lines(lines: list[Line], mask, hop_s: float) -> list[int]:
+    """A held word ("time....." sung for four seconds) often comes back from the aligner as a sliver of zero length
+    somewhere in the middle of the note, with a confidence near zero. For such a line the voice is still going
+    strongly, so its start and end are taken from the sound itself: back to where the singing under it began and
+    forward to where it stops, but never into the previous line or past the next line's start. Returns the indexes
+    of the lines changed."""
+    import numpy as np
+
+    m = np.asarray(mask, dtype=bool)
+    gap = max(1, int(HELD_BRIDGE_S / hop_s))
+    changed: list[int] = []
+    for i, l in enumerate(lines):
+        if l.start is None or l.end is None:
+            continue
+        if not ((l.end - l.start) < SUSPICIOUS_MIN_SECONDS or (l.confidence is not None and l.confidence < FAILED_CONFIDENCE)):
+            continue
+        prev_end = max((o.end for o in lines[:i] if o.end is not None), default=0.0)
+        nxt = next((o.start for o in lines[i + 1:] if o.start is not None), None)
+        floor = int(prev_end / hop_s)
+        ceil = min(len(m), int(nxt / hop_s) if nxt is not None else len(m))
+        core = next((k for k in range(max(floor, int((l.start - HELD_BRIDGE_S) / hop_s)),
+                                      min(ceil, int((l.end + HELD_BRIDGE_S) / hop_s) + 1)) if m[k]), None)
+        if core is None:
+            continue
+        lo = hi = core   # grow over the sound, bridging silences shorter than HELD_BRIDGE_S
+        for k in range(core - 1, floor - 1, -1):
+            if m[k]:
+                lo = k
+            elif lo - k > gap:
+                break
+        for k in range(core + 1, ceil):
+            if m[k]:
+                hi = k
+            elif k - hi > gap:
+                break
+        new_start, new_end = round(lo * hop_s, 3), round(min((hi + 1) * hop_s, nxt if nxt is not None else 1e9), 3)
+        if new_end - new_start <= (l.end - l.start) + 0.05:
+            continue
+        l.start, l.end = new_start, new_end
+        if l.words:
+            l.words[0]["start"], l.words[-1]["end"] = new_start, new_end
+            for w in l.words:
+                w["start"] = min(max(w["start"], new_start), new_end)
+                w["end"] = min(max(w["end"], w["start"]), new_end)
+        changed.append(i)
+    return changed
+
+
 def find_sung_blocks(mask, hop_s: float, min_gap_s: Optional[float] = None,
                      min_length_s: float = BLOCK_MIN_LENGTH_S) -> list[tuple[float, float]]:
     """Where the singing is: stretches of sound in the vocal track, joined across pauses shorter than min_gap_s,
@@ -501,7 +602,7 @@ def plan_blocks(lines: list[Line], blocks: list[tuple[float, float]],
     def cut_cost(j: int) -> float:  # starting a new block's lyrics at line j
         if j <= 0 or j >= N:
             return 0.0
-        if not lines[j].labels:
+        if not lines[j].labels and not lines[j].rest_before:   # a rest the user wrote is as good a cut place as a new section
             return PLAN_NON_SECTION_CUT_PENALTY
         return -PLAN_INSTRUMENTAL_CUT_BONUS if _expects_break(lines[j]) else 0.0
 
@@ -722,7 +823,6 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     runs = _sound_runs(mask, hop_s)
     pauses = [b[0] - a[1] for a, b in zip(runs, runs[1:])]
     break_s = choose_gap_threshold(pauses)
-    clear_breaks = _jump_threshold(pauses) is not None   # False: breaks found only by the plain 5 s minimum
     blocks = find_sung_blocks(mask, hop_s)
     info: dict = {"mode": "whole song", "blocks": [],
                   "break_length_s": None if break_s is None else round(break_s, 1)}  # pauses longer than this split the singing
@@ -731,15 +831,14 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     if len(blocks) >= 2:
         info["mode"] = "singing blocks"
         say(f"Found {len(blocks)} stretches of singing; matching lyric sections to them...")
+        # Block lengths are only a rough guide to which section is where (held notes and rests make the pace very
+        # uneven, and a clear-looking set of breaks can still be paired wrongly), so always listen to each block and
+        # see which lyrics it actually holds; lengths then only break ties.
         evidence = None
-        if not clear_breaks:
-            # The breaks did not stand out clearly (pauses grow gradually), so block lengths are a weak guide to which
-            # section is where: listen to each block and see which lyrics it actually holds. Songs whose breaks do
-            # stand out keep the length-based pairing, which has worked on every song tried so far.
-            heard_text = _transcribe_blocks(model, audio, blocks, language, say)
-            if heard_text:
-                evidence = match_evidence(lines, heard_text)
-                info["evidence"] = "transcript" if evidence else "none"
+        heard_text = _transcribe_blocks(model, audio, blocks, language, say)
+        if heard_text:
+            evidence = match_evidence(lines, heard_text)
+            info["evidence"] = "transcript" if evidence else "none"
         plan = plan_blocks(lines, blocks, evidence)
         fits = block_fit(lines, blocks, plan)
         for k, ((b_start, b_end), idxs) in enumerate(zip(blocks, plan)):
@@ -767,7 +866,12 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
     flag_lines(lines)
     repaired, mask, hop_s = repair_failed(model, str(vocals_path), lines, language, say, audio=audio)
     info["lines_trimmed"] = trim_line_ends(lines, mask, hop_s)  # before the final flags, so "very long" means still long
+    info["lines_snapped"] = snap_line_starts(lines, mask, hop_s)
+    stretched = stretch_held_lines(lines, mask, hop_s)
+    info["lines_stretched"] = len(stretched)
     flag_lines(lines)
+    for i in stretched:
+        lines[i].flags.append("held note: start and end taken from the sound under it")
     for i, l in enumerate(lines):
         if l.start is not None and voiced_fraction(mask, hop_s, l.start, l.end) < VOICED_MIN_FRACTION:
             l.flags.append("little singing detected at this time")
