@@ -18,7 +18,7 @@ from lyricsync_tab import LyricTimingTab
 
 APP_TITLE = "Music File Instrument Remover"
 VERSION = "0.3.0"
-WIN_W, WIN_H = 640, 760
+WIN_W, WIN_H = 780, 940
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +37,11 @@ class DrumRemoverApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} v{VERSION}")
-        self.resizable(False, False)
-        self.geometry(f"{WIN_W}x{WIN_H}")
+        # Resizable, opening taller/wider than before but never bigger than the screen.
+        w = min(WIN_W, self.winfo_screenwidth() - 40)
+        h = min(WIN_H, self.winfo_screenheight() - 100)
+        self.geometry(f"{w}x{h}")
+        self.minsize(640, min(740, h))
 
         self._cfg = config.load()
         self._input_path: Path | None = None

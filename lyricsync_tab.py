@@ -33,6 +33,7 @@ class LyricTimingTab:
         self._audio: Path | None = None
         self._busy = False
         self._last_dir: Path | None = None
+        self._full_text = ""
         self._build()
 
     # ------------------------------------------------------------------ layout
@@ -82,19 +83,32 @@ class LyricTimingTab:
         self._status = tk.StringVar(value="Ready. Output files go next to the song (or the default output folder).")
         ttk.Label(f, textvariable=self._status, anchor="w", relief="sunken", padding=4).pack(fill="x", padx=12, pady=4)
 
-        res = ttk.LabelFrame(f, text="Result (this is what to paste into Claude chat/design)")
+        res = ttk.LabelFrame(f, text="Result (Copy puts both parts on the clipboard, ready to paste into Claude chat/design)")
         res.pack(fill="both", expand=True, **pad)
-        self._result = tk.Text(res, height=10, width=70, wrap="none", font=("Consolas", 9), state="disabled")
-        rsb = ttk.Scrollbar(res, command=self._result.yview)
-        self._result.configure(yscrollcommand=rsb.set)
-        self._result.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        rsb.pack(side="left", fill="y", pady=6, padx=(0, 2))
         btns = ttk.Frame(res)
-        btns.pack(side="top", padx=6, pady=6)
+        btns.pack(side="right", fill="y", padx=6, pady=6)
+        # Two panes the user can resize by dragging the divider: the timed lyrics, and the warnings
+        # (which can be long) so they never push the lyrics out of view.
+        panes = ttk.PanedWindow(res, orient="vertical")
+        panes.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        self._result = self._scrolled_text(panes, "Timed lyrics", weight=3)
+        self._warnings = self._scrolled_text(panes, "Flagged lines / warnings", weight=2)
         self._copy_btn = ttk.Button(btns, text="Copy", command=self._copy, state="disabled")
         self._copy_btn.pack(pady=2)
         self._open_btn = ttk.Button(btns, text="Open folder", command=self._open_folder, state="disabled")
         self._open_btn.pack(pady=2)
+
+    @staticmethod
+    def _scrolled_text(panes: ttk.PanedWindow, title: str, weight: int) -> tk.Text:
+        """A read-only, word-wrapped text box with its own vertical scrollbar, added to `panes`."""
+        box = ttk.LabelFrame(panes, text=title)
+        text = tk.Text(box, height=5, width=70, wrap="word", font=("Consolas", 9), state="disabled")
+        sb = ttk.Scrollbar(box, command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        text.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        sb.pack(side="left", fill="y", pady=4, padx=(0, 2))
+        panes.add(box, weight=weight)
+        return text
 
     # ---------------------------------------------------------------- handlers
 
@@ -129,18 +143,20 @@ class LyricTimingTab:
 
     def _copy(self):
         self._root.clipboard_clear()
-        self._root.clipboard_append(self._result.get("1.0", "end").strip())
+        self._root.clipboard_append(self._full_text.strip())
         self._status.set("Result copied to the clipboard.")
 
     def _open_folder(self):
         if self._last_dir:
             subprocess.Popen(["explorer", str(self._last_dir)])
 
-    def _set_result(self, text: str):
-        self._result.configure(state="normal")
-        self._result.delete("1.0", "end")
-        self._result.insert("1.0", text)
-        self._result.configure(state="disabled")
+    def _set_result(self, timed: str, warnings: str = ""):
+        self._full_text = timed + ("\n" + warnings + "\n" if warnings else "")
+        for box, text in ((self._result, timed), (self._warnings, warnings)):
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.configure(state="disabled")
 
     # --------------------------------------------------------------- processing
 
@@ -208,7 +224,7 @@ class LyricTimingTab:
         self._progress.set(100)
         note = "" if not res["flagged"] else f"  {res['flagged']} line(s) marked ! - worth a second look."
         self._status.set(f"Done ✔  {res['lines']} lines timed on the {res['device_used'].upper()}.{note}")
-        self._set_result(res["timed_text"] + "\n" + res["report"] + "\n")
+        self._set_result(res["timed_text"], res["report"])
 
     def _failed(self, message: str):
         self._busy = False
