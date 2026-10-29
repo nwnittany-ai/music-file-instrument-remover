@@ -154,20 +154,22 @@ def _pipeline(audio: Path, lyrics_text: str, output_dir: Path, model: str, devic
     duration = lc.audio_duration(audio)
     meta = {"title": title, "audio": str(audio), "vocals": str(vocal_path), "model": model, "language": language,
             "device": device, "duration": duration, "line_count": len(lines),
-            "alignment_mode": found["mode"], "singing_blocks": found["blocks"]}
+            "alignment_mode": found["mode"], "singing_blocks": found["blocks"], "warnings": found.get("warnings", [])}
     files = {
         "timed": output_dir / f"{stem}_timed.txt",
         "lrc": output_dir / f"{stem}.lrc",
         "json": output_dir / f"{stem}_timing.json",
     }
-    timed_text = lc.to_timed_text(lines, title, duration, blocks=found["blocks"], mode=found["mode"])
+    warnings = found.get("warnings", [])
+    timed_text = lc.to_timed_text(lines, title, duration, blocks=found["blocks"], mode=found["mode"], warnings=warnings)
     files["timed"].write_text(timed_text, encoding="utf-8")
     files["lrc"].write_text(lc.to_lrc(lines, words=words), encoding="utf-8")
     files["json"].write_text(lc.to_json(lines, meta), encoding="utf-8")
     flagged = sum(1 for l in lines if l.flags)
     say(1.0, f"Done. {len(lines)} lines timed, {flagged} flagged.")
     return {"files": {k: str(v) for k, v in files.items()}, "lines": len(lines), "flagged": flagged,
-            "timed_text": timed_text, "report": lc.report(lines), "output_dir": str(output_dir)}
+            "warnings": len(warnings), "timed_text": timed_text, "report": lc.report(lines, warnings),
+            "output_dir": str(output_dir)}
 
 
 def run(audio: Path, lyrics_text: str, output_dir: Path, model: str = "medium", device: str = "auto",

@@ -143,12 +143,26 @@ transcribe, it falls back to block lengths. After aligning, three corrections us
 line's end is pulled back to where the singing under it really stops (alignment can stretch an end across a long
 pause); a line whose first word was stretched back across silence has its start moved to where the sound begins; and
 a held word the aligner collapsed to a sliver (`time.....` sung for four seconds) is stretched over its note, never
-into the neighbouring lines, and marked `held note`. The header says which path was used
+into the neighbouring lines, and marked `held note`. (A line's start is only moved when the sound under it is
+just the tail of the previous phrase and the next real start of singing follows at least 0.6 s of silence, so a short
+first word followed by a brief breath is left alone.) The header says which path was used
 (`Alignment: singing blocks` or `whole song`).
+**Warnings.** So a result never looks more certain than it is, the tool checks its own output and prints `WARNING:` lines
+in the `_timed.txt` header, in the GUI result box (and the status line), and in `<song>_timing.json` under
+`meta.warnings` (each with the line numbers involved, ready for a future "fix these lines" step). It warns when three or
+more lines in a row are squeezed into the same moment (the aligner gave up on them; those lines also get a `!`), when
+12 s or more of singing-like sound sits between two lines with no lyric on it, and when singing continues 12 s or more
+after the last lyric within its stretch. A warning usually means: add rough times (`m:ss` in front of a few lines)
+and re-run, or check whether lyrics are missing or a line is not actually sung.
 Echo lines written in parentheses, such as `(Who will he see next?)`, are not timed: they are sung, so they are given
 to the aligner with the line before them (so a held last note is not shared out wrongly), but they get no line of
 their own in the output.
 Tests (no pytest or model needed): `.venv\Scripts\python.exe tests\test_lyricsync.py`.
+Scoring against known-good timings: `.venv\Scripts\python.exe tests\score_lyricsync.py` (add `--run` to re-run the tool
+on each song first). It compares each line's start with a reference answer kept in `test_data\reference\` (git-ignored,
+because it holds lyrics and song paths; the format is described at the top of the script) and prints how many lines are
+within tolerance, the median and worst errors, and the worst lines. Add a reference for any song whose timing you have
+corrected by hand, and a change to the tool is judged by whether these numbers improve without any song getting worse.
 
 The GUI has the same thing as the **Lyric Timing** tab (paste lyrics, pick a song, copy the result).
 Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ignored) so a re-run

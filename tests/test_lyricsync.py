@@ -304,6 +304,64 @@ def test_starts_already_on_the_sound_or_on_a_stray_tail_are_left_alone():
     assert lc.snap_line_starts([after_tail], mask, 0.02) == 1 and abs(after_tail.start - 19.9) < 0.05
 
 
+def test_a_line_that_starts_in_the_tail_of_the_previous_phrase_is_moved_to_its_own_sound():
+    # "Every Day the Same": the aligner put "go to work" at 24.8, inside a 0.4 s tail of "get awake"; the phrase is at 26.4
+    mask = _mask([(23.6, 25.24), (26.4, 27.7)], 40.0)
+    line = lc.Line(0, "go to work", start=24.82, end=27.38)
+    assert lc.snap_line_starts([line], mask, 0.02) == 1 and abs(line.start - 26.3) < 0.05, line.start
+
+
+def test_a_short_first_word_followed_by_a_brief_pause_is_not_skipped():
+    short_then_pause = _mask([(10.0, 10.4), (10.7, 13.0)], 20.0)     # "go" ... "to work": 0.3 s breath between them
+    line = lc.Line(0, "go to work", start=10.0, end=13.0)
+    assert lc.snap_line_starts([line], short_then_pause, 0.02) == 0 and line.start == 10.0
+    in_tail = _mask([(9.0, 10.4), (10.7, 13.0)], 20.0)               # starts in the tail, but only a 0.3 s breath follows
+    tail_line = lc.Line(1, "to work", start=10.0, end=13.0)
+    assert lc.snap_line_starts([tail_line], in_tail, 0.02) == 0 and tail_line.start == 10.0
+
+
+def test_lines_squeezed_into_one_moment_are_reported_and_flagged():
+    lines = [lc.Line(i, f"l{i}", start=s, end=e) for i, (s, e) in enumerate(
+        [(10.0, 12.0), (14.0, 16.0), (20.0, 20.0), (20.0, 20.0), (20.1, 20.1), (20.1, 20.2), (30.0, 32.0)])]
+    mask = _mask([(10.0, 12.0), (14.0, 16.0), (20.0, 23.0), (30.0, 32.0)], 40.0)
+    (warn,) = lc.sanity_warnings(lines, mask, 0.02)
+    assert warn["lines"] == [3, 6] and "squeezed" in warn["text"] and "4 lines" in warn["text"]
+    assert [bool(l.flags) for l in lines] == [False, False, True, True, True, True, False]
+    two = [lc.Line(0, "a", start=5.0, end=5.1), lc.Line(1, "b", start=5.2, end=5.3)]
+    assert lc.sanity_warnings(two, _mask([(5.0, 5.4)], 10.0), 0.02) == []        # two close lines are not a pile-up
+
+
+def test_sound_with_no_lyric_on_it_is_reported_between_lines_and_after_the_last_line():
+    mask = _mask([(10.0, 14.0), (14.5, 60.0)], 80.0)
+    lines = [lc.Line(0, "a", start=10.0, end=14.0), lc.Line(1, "b", start=30.0, end=33.0)]
+    warns = lc.sanity_warnings(lines, mask, 0.02, blocks=[{"start": 10.0, "end": 60.5}])
+    assert [w["lines"] for w in warns] == [[1, 2], [2, 2]]
+    assert "16 s of singing-like sound at 0:14.0-0:30.0" in warns[0]["text"] and "after the last lyric" in warns[1]["text"]
+    # silence between lines, or a short held note, is normal and stays quiet
+    quiet = lc.sanity_warnings([lc.Line(0, "a", start=10.0, end=14.0), lc.Line(1, "b", start=30.0, end=33.0)],
+                               _mask([(10.0, 14.0), (30.0, 33.0)], 80.0), 0.02)
+    assert quiet == []
+    held = lc.sanity_warnings([lc.Line(0, "a", start=10.0, end=14.0), lc.Line(1, "b", start=22.0, end=25.0)],
+                              _mask([(10.0, 25.0)], 80.0), 0.02)
+    assert held == []                                                            # an 8 s held note is under the limit
+
+
+def test_a_later_block_without_lyrics_is_not_reported_as_singing_after_the_last_lyric():
+    mask = _mask([(10.0, 20.0), (60.0, 100.0)], 120.0)                           # a reprise block with no lyrics matched
+    lines = [lc.Line(0, "a", start=10.0, end=19.5)]
+    blocks = [{"start": 10.0, "end": 20.0, "first_line": 1}, {"start": 60.0, "end": 100.0, "first_line": None}]
+    assert lc.sanity_warnings(lines, mask, 0.02, blocks) == []
+
+
+def test_warnings_appear_in_the_summary_and_the_report():
+    line = lc.Line(0, "x", start=1.0, end=2.0)
+    w = [{"lines": [1, 1], "text": "something looks off"}]
+    assert "WARNING: something looks off" in lc.to_timed_text([line], "t", 10.0, warnings=w)
+    assert "WARNING:" not in lc.to_timed_text([line], "t", 10.0)
+    assert lc.report([line], w).startswith("WARNING: something looks off") and "no flags" in lc.report([line], w)
+    assert lc.report([line]) == "All lines aligned with no flags."
+
+
 def test_a_held_word_that_came_back_as_a_sliver_is_stretched_over_its_note():
     mask = _mask([(100.0, 112.0)], 130.0)            # one long sustained note, 100-112 s
     prev = lc.Line(0, "before", start=90.0, end=96.0, confidence=0.9)

@@ -223,6 +223,8 @@ class LyricTimingTab:
         self._last_dir = Path(res["output_dir"])
         self._progress.set(100)
         note = "" if not res["flagged"] else f"  {res['flagged']} line(s) marked ! - worth a second look."
+        if res.get("warnings"):
+            note += f"  {res['warnings']} WARNING(S) - the timing may be unreliable, see the box below."
         self._status.set(f"Done ✔  {res['lines']} lines timed on the {res['device_used'].upper()}.{note}")
         self._set_result(res["timed_text"], res["report"])
 

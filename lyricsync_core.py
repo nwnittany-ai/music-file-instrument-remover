@@ -54,6 +54,10 @@ SNAP_PAD_S = 0.1               # ...a little before the first sustained sound
 SNAP_WINDOW_S = 0.6            # "sustained sound" = most of this window is voiced...
 SNAP_DENSITY = 0.6             # ...i.e. at least this fraction of it
 HELD_BRIDGE_S = 0.3            # a held word's sound may have dips this short (breath, vibrato) and still be one note
+SANITY_PILE_UP_LINES = 3       # this many lines in a row starting within SANITY_PILE_UP_STEP_S of each other were not really placed
+SANITY_PILE_UP_STEP_S = 0.6
+SANITY_UNPLACED_S = 12.0       # this much sound with no lyric on it (between two lines, or after the last one) is reported...
+SANITY_UNPLACED_VOICED = 0.7   # ...when at least this fraction of it is singing-like sound
 ESTIMATE_FLAG ="estimated: spread over the singing block by word count (alignment failed here)"
 
 
@@ -209,10 +213,11 @@ def to_lrc(lines: list[Line], words: bool = False) -> str:
 
 
 def to_timed_text(lines: list[Line], title: str, duration: Optional[float], blocks: Optional[list] = None,
-                  mode: Optional[str] = None) -> str:
+                  mode: Optional[str] = None, warnings: Optional[list] = None) -> str:
     """Readable summary meant to be pasted into Claude chat/design: where lyrics begin and end,
     instrumental gaps, then every line with its start-end time. `blocks` (from align_vocals) adds where
-    the singing was found; `mode` says which alignment path was used ("singing blocks" or "whole song")."""
+    the singing was found; `mode` says which alignment path was used ("singing blocks" or "whole song");
+    `warnings` (from sanity_warnings) are listed as "WARNING:" lines above the times."""
     timed = [l for l in lines if l.start is not None]
     out = [f"Song: {title}" + (f"  (length {_clock(duration)})" if duration else "")]
     if mode:
@@ -236,6 +241,8 @@ def to_timed_text(lines: list[Line], title: str, duration: Optional[float], bloc
         if gaps:
             out.append("Instrumental gaps (>= %.0fs): " % GAP_REPORT_SECONDS
                        + ", ".join(f"{_clock(a)}-{_clock(b)} ({b - a:.1f}s)" for a, b in gaps))
+    for w in warnings or []:
+        out.append("WARNING: " + w["text"])
     flagged = [l for l in lines if l.flags]
     if flagged:
         out.append(f"{len(flagged)} line(s) flagged for a second look (marked with !)")
@@ -255,12 +262,17 @@ def to_json(lines: list[Line], meta: dict) -> str:
     return json.dumps({"meta": meta, "lines": [asdict(l) for l in lines]}, indent=2, ensure_ascii=False)
 
 
-def report(lines: list[Line]) -> str:
+def report(lines: list[Line], warnings: Optional[list] = None) -> str:
     flagged = [l for l in lines if l.flags]
+    parts = []
+    if warnings:
+        parts.append("\n".join(f"WARNING: {w['text']}" for w in warnings))
     if not flagged:
-        return "All lines aligned with no flags."
-    return "\n".join(f"line {l.index + 1} ({_clock(l.start) if l.start is not None else '--'}): "
-                     f"{l.text}  <- {'; '.join(l.flags)}" for l in flagged)
+        parts.append("All lines aligned with no flags.")
+    else:
+        parts.append("\n".join(f"line {l.index + 1} ({_clock(l.start) if l.start is not None else '--'}): "
+                               f"{l.text}  <- {'; '.join(l.flags)}" for l in flagged))
+    return "\n\n".join(parts)
 
 
 def audio_duration(path: Path) -> Optional[float]:
@@ -377,24 +389,45 @@ def trim_line_ends(lines: list[Line], mask, hop_s: float) -> int:
 
 
 def _first_onset(m, hop_s: float, t0: float, t1: float) -> Optional[float]:
-    """Time of the first sustained start of singing in [t0, t1): a voiced frame followed by a window that is mostly
-    voiced. A stray tail of the previous line's sound (a few frames) does not count. None when there is none."""
+    """Time of the first sustained start of singing in [t0, t1): a voiced frame that follows at least SNAP_LEAD_MIN_S
+    of silence (so the tail of the previous phrase, and a breath inside a phrase, are not onsets) and is followed by a
+    window that is mostly voiced. None when there is none."""
     import numpy as np
 
     w = max(1, int(SNAP_WINDOW_S / hop_s))
+    quiet = max(1, int(SNAP_LEAD_MIN_S / hop_s))
     cum = np.concatenate(([0], np.cumsum(np.asarray(m, dtype=np.int64))))
     a, b = max(0, int(t0 / hop_s)), min(len(m), int(t1 / hop_s))
     for i in range(a, b):
-        if m[i] and (cum[min(i + w, len(m))] - cum[i]) >= SNAP_DENSITY * w:
+        if m[i] and not cum[i] - cum[max(0, i - quiet)] and (cum[min(i + w, len(m))] - cum[i]) >= SNAP_DENSITY * w:
             return i * hop_s
     return None
+
+
+def _sound_stretch_s(m, hop_s: float, t: float) -> float:
+    """Seconds of unbroken singing starting at time t (dips shorter than 0.1 s do not break it); 0 when t is silent."""
+    i = int(t / hop_s)
+    if i >= len(m) or not m[i]:
+        return 0.0
+    bridge = max(1, int(0.1 / hop_s))
+    end = k = i
+    while k < len(m):
+        if m[k]:
+            end = k
+        elif k - end > bridge:
+            break
+        k += 1
+    return (end - i + 1) * hop_s
 
 
 def snap_line_starts(lines: list[Line], mask, hop_s: float) -> int:
     """Move a line's start forward to where its sound begins. The aligner tends to stretch a line's first word back
     across the silence before it ("we" spanning 2 s of nothing), so the line looks like it starts long before anyone
-    sings. If the first SNAP_LEAD_MIN_S of a line is silent in the vocal track and singing starts later inside the
-    line, the start moves there (less SNAP_PAD_S). Only ever moves a start later. Returns how many were moved."""
+    sings. If the line does not start on sustained singing (the sound under its start lasts under SNAP_WINDOW_S, i.e.
+    it is silence or only the tail of the previous phrase) and a sustained start of singing, preceded by at least
+    SNAP_LEAD_MIN_S of silence, comes later inside the line, the start moves there (less SNAP_PAD_S). A short first
+    word followed by a brief pause is not skipped: only a silence of SNAP_LEAD_MIN_S or more is jumped over. Only ever
+    moves a start later. Returns how many were moved."""
     import numpy as np
 
     m = np.asarray(mask, dtype=bool)
@@ -402,8 +435,8 @@ def snap_line_starts(lines: list[Line], mask, hop_s: float) -> int:
     for l in lines:
         if l.start is None or l.end is None:
             continue
-        if voiced_fraction(m, hop_s, l.start, l.start + SNAP_LEAD_MIN_S) >= SNAP_DENSITY:
-            continue   # already on the sound
+        if _sound_stretch_s(m, hop_s, l.start) >= SNAP_WINDOW_S:
+            continue   # already on sustained singing
         onset = _first_onset(m, hop_s, l.start, l.end)
         if onset is None or onset - l.start < SNAP_LEAD_MIN_S:
             continue
@@ -465,6 +498,56 @@ def stretch_held_lines(lines: list[Line], mask, hop_s: float) -> list[int]:
                 w["end"] = min(max(w["end"], w["start"]), new_end)
         changed.append(i)
     return changed
+
+
+def sanity_warnings(lines: list[Line], mask, hop_s: float, blocks: Optional[list] = None) -> list[dict]:
+    """Things that look wrong in a finished timing, in plain words, so a result never looks more certain than it is.
+    Returns [{"lines": [first, last] (1-based), "text": message}]. Checks:
+      - several lines in a row squeezed into the same moment (the aligner gave up on them; they also get a flag);
+      - a long stretch of singing-like sound with no lyric on it, between two lines or after the last one: a held note
+        or an instrumental, or lines timed too early / lyrics missing.
+    `blocks` (from align_vocals) limits the after-the-last-line check to the stretch of singing the last line is in."""
+    import numpy as np
+
+    m = np.asarray(mask, dtype=bool)
+    out: list[dict] = []
+    timed = [(i, l) for i, l in enumerate(lines) if l.start is not None and l.end is not None]
+
+    runs: list[list[int]] = []
+    for i, l in timed:
+        if runs and i == runs[-1][-1] + 1 and l.start - lines[runs[-1][-1]].start <= SANITY_PILE_UP_STEP_S:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    for run in runs:
+        if len(run) >= SANITY_PILE_UP_LINES:
+            a, b = run[0], run[-1]
+            out.append({"lines": [a + 1, b + 1], "text":
+                        f"Lines {a + 1}-{b + 1} ({len(run)} lines) are squeezed into the same moment, around "
+                        f"{_clock(lines[a].start)}: the aligner could not place them. Rough times (m:ss in front of a few "
+                        "of the lines) and a re-run usually fix this."})
+            for k in run:
+                if "squeezed together with neighbouring lines" not in lines[k].flags:
+                    lines[k].flags.append("squeezed together with neighbouring lines")
+
+    for (i, a), (j, b) in zip(timed, timed[1:]):
+        gap = b.start - a.end
+        if gap >= SANITY_UNPLACED_S and voiced_fraction(m, hop_s, a.end, b.start) >= SANITY_UNPLACED_VOICED:
+            out.append({"lines": [i + 1, j + 1], "text":
+                        f"{gap:.0f} s of singing-like sound at {_clock(a.end)}-{_clock(b.start)} has no lyric on it "
+                        f"(between lines {i + 1} and {j + 1}): a held note or an instrumental, or those lines are timed too early."})
+
+    if timed:
+        i, last = timed[-1]
+        end_t = next((b["end"] for b in blocks or [] if b["start"] <= last.end <= b["end"] + 0.5), None)
+        if end_t is None:
+            voiced = np.flatnonzero(m)
+            end_t = (voiced[-1] + 1) * hop_s if voiced.size else last.end
+        if end_t - last.end >= SANITY_UNPLACED_S and voiced_fraction(m, hop_s, last.end, end_t) >= SANITY_UNPLACED_VOICED:
+            out.append({"lines": [i + 1, i + 1], "text":
+                        f"Singing continues for {end_t - last.end:.0f} s after the last lyric ends ({_clock(last.end)}-"
+                        f"{_clock(end_t)}): lyrics may be missing at the end, or the last lines are timed too early."})
+    return out
 
 
 def find_sung_blocks(mask, hop_s: float, min_gap_s: Optional[float] = None,
@@ -879,6 +962,7 @@ def align_vocals(vocals_path: Path, lines: list[Line], model_name: str = "medium
             l.flags.append(ESTIMATE_FLAG)
     for i in repaired:
         lines[i].repaired = True
+    info["warnings"] = sanity_warnings(lines, mask, hop_s, info["blocks"])
     del model
     try:
         import torch
