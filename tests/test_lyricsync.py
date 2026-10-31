@@ -632,6 +632,34 @@ def test_slow_verses_with_three_second_line_pauses_still_pair_with_the_right_sec
         assert info["break_length_s"] is not None and 3.2 < info["break_length_s"] < 9.6
 
 
+def test_a_blocked_lameenc_does_not_stop_audio_from_being_read():
+    """Windows Smart App Control can refuse lameenc's unsigned DLL; demucs only imports it for an MP3 writer we never use."""
+    import types
+
+    import core
+
+    saved = sys.modules.get("lameenc", "absent")
+    try:
+        sys.modules["lameenc"] = None                         # makes "import lameenc" fail, like a blocked DLL
+        core._tolerate_blocked_lameenc()
+        stand_in = sys.modules["lameenc"]
+        assert stand_in is not None and hasattr(stand_in, "Encoder")
+        try:
+            stand_in.Encoder()
+            raise AssertionError("the stand-in encoder must refuse to encode")
+        except RuntimeError as exc:
+            assert "unavailable" in str(exc) and "ffmpeg" in str(exc)
+        working = types.ModuleType("lameenc")                 # a lameenc that loads fine is left alone
+        sys.modules["lameenc"] = working
+        core._tolerate_blocked_lameenc()
+        assert sys.modules["lameenc"] is working
+    finally:
+        if saved == "absent":
+            sys.modules.pop("lameenc", None)
+        else:
+            sys.modules["lameenc"] = saved
+
+
 def test_times_never_read_sixty_seconds():
     assert lc._clock(59.97) == "1:00.0" and lc._clock(179.96) == "3:00.0" and lc._clock(75.34) == "1:15.3"
     assert lc._clock(0.0) == "0:00.0" and lc._clock(-1) == "0:00.0" and lc._clock(125.0, tenths=False) == "2:05"

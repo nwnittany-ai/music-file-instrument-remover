@@ -144,6 +144,32 @@ def _copy_metadata(input_path: Path, output_path: Path, stem_label: str) -> None
         logging.warning("Could not copy metadata to %s: %s", output_path.name, e)
 
 
+def _tolerate_blocked_lameenc() -> None:
+    """demucs.audio imports lameenc (an MP3 encoder) at the top, but only uses it in encode_mp3(), which this project
+    never calls: MP3 output goes through ffmpeg (see _save_audio) and input is decoded by ffmpeg. lameenc is an unsigned
+    native DLL, and on a Windows machine with Smart App Control (or another Application Control policy) it can be refused,
+    which would otherwise make *reading* audio fail ("DLL load failed while importing lameenc"). If it cannot be loaded,
+    give demucs a stand-in so it imports; the stand-in only raises if something actually tries to encode with it."""
+    import sys
+    import types
+
+    try:
+        import lameenc  # noqa: F401
+    except ImportError as exc:
+        reason = str(exc)
+        logging.warning("lameenc could not be loaded (%s); continuing without it - it is only needed for demucs' own "
+                        "MP3 writer, which this project does not use.", reason)
+
+        class Encoder:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(f"MP3 encoding through lameenc is unavailable here ({reason}); "
+                                   "this project encodes MP3 with ffmpeg instead.")
+
+        stand_in = types.ModuleType("lameenc")
+        stand_in.Encoder = Encoder
+        sys.modules["lameenc"] = stand_in
+
+
 def _save_audio(tensor, sample_rate: int, out_path: Path, output_format: str) -> None:
     """Save a (channels, samples) tensor to WAV or MP3."""
     import numpy as np
@@ -220,6 +246,7 @@ def separate_stems(
     if progress_callback:
         progress_callback(0.0, f"Loading model '{model}'...")
 
+    _tolerate_blocked_lameenc()
     try:
         from demucs.pretrained import get_model
         from demucs.apply import apply_model
