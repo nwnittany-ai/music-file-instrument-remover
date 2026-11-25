@@ -67,6 +67,16 @@ Then check the GPU is still in use (should print `2.11.0+cu128 True`):
 The model itself (`vocals_mel_band_roformer.ckpt`, about 900 MB) is kept in the `models\` folder. If it is missing
 it is downloaded automatically the first time RoFormer is used.
 
+### Rebuilding an exact environment
+`venv_snapshots\` holds the exact package lists (`pip freeze`) of the working environment:
+`pip_freeze_2026-11-24_after_roformer.txt` (current, with RoFormer) and `..._before_roformer.txt` (the setup before it).
+To rebuild one in a fresh venv (Python 3.13):
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r venv_snapshots\pip_freeze_2026-11-24_after_roformer.txt --extra-index-url https://download.pytorch.org/whl/cu128
+```
+Then check the GPU as in step 5. The RoFormer model is downloaded again on first use (or copy `models\` across).
+
 ## Vocal separation: Demucs or RoFormer
 
 **Advanced tab → Vocal separation** (CLI: `--vocals demucs|roformer`) chooses what separates the vocals:
