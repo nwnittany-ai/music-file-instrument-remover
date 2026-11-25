@@ -37,3 +37,6 @@ models/
 
 # pip freeze snapshots taken before venv changes (machine-specific)
 venv_snapshots/
+
+# Previous venv kept after switching to the RoFormer-enabled one (2026-11-24)
+.venv_original/
