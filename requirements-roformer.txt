@@ -1,0 +1,7 @@
+# Optional: Mel-Band RoFormer vocal separation (Advanced tab > Vocal separation > RoFormer, or --vocals roformer).
+# Install AFTER requirements.txt, WITH the constraints file, so pip keeps the CUDA build of PyTorch:
+#   .\.venv\Scripts\python.exe -m pip install -r requirements-roformer.txt -c constraints-roformer.txt --extra-index-url https://download.pytorch.org/whl/cu128
+# Without -c, pip replaces torch with a CPU-only build and Demucs, drum removal and lyric timing silently lose the GPU.
+audio-separator==0.48.0
+onnxruntime
+audioread

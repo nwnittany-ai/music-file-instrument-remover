@@ -1,0 +1,5 @@
+# Keep the GPU (CUDA 12.8) build of PyTorch that Demucs, drum removal and lyric timing use.
+# Used with requirements-roformer.txt; see README.md "Vocal separation: Demucs or RoFormer".
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+numpy==2.4.6

@@ -13,6 +13,19 @@ SUPPORTED_EXTENSIONS = {".mp3", ".wav"}
 AVAILABLE_MODELS = ["htdemucs", "htdemucs_ft", "mdx", "mdx_extra", "mdx_q", "mdx_extra_q"]
 DEFAULT_MODEL = "htdemucs_ft"
 
+# How vocals are separated. Only affects stem='vocals' and stem='all' (and lyric timing, which asks for vocals);
+# removing drums, bass or other always uses Demucs.
+#   demucs   - the Demucs model above does everything (the original behaviour)
+#   roformer - Mel-Band RoFormer splits vocals from the instrumental (cleaner gaps between sung lines); for 'all',
+#              Demucs then splits that instrumental into drums, bass and other
+VOCAL_METHODS = {
+    "demucs":   "Demucs (current)",
+    "roformer": "RoFormer (cleaner vocals)",
+}
+DEFAULT_VOCAL_METHOD = "demucs"
+ROFORMER_MODEL_FILE = "vocals_mel_band_roformer.ckpt"   # Kimberley Jensen's weights, CC BY-NC-SA 4.0 (non-commercial)
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+
 # Stems supported for isolation. "all" = full 4-stem separation.
 AVAILABLE_STEMS = ["drums", "vocals", "bass", "other", "all"]
 DEFAULT_STEM = "drums"
@@ -208,9 +221,10 @@ def separate_stems(
     device_preference: str = "gpu",
     output_format: str = DEFAULT_FORMAT,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    vocal_method: str = DEFAULT_VOCAL_METHOD,
 ) -> list[Path]:
     """
-    Run Demucs stem separation on input_path.
+    Run stem separation on input_path (Demucs, or RoFormer for vocals when vocal_method='roformer').
 
     Args:
         input_path:         Path to input MP3 or WAV file.
@@ -220,6 +234,7 @@ def separate_stems(
         device_preference:  'gpu' or 'cpu'.
         output_format:      Output file format: 'wav' (default, 24-bit) or 'mp3' (320kbps).
         progress_callback:  Optional callable(fraction: float, message: str).
+        vocal_method:       'demucs' (default) or 'roformer'. Only used for stem 'vocals' and 'all'.
 
     Returns:
         List of Paths to output files.
@@ -234,6 +249,11 @@ def separate_stems(
             f"Unknown stem '{stem}'. Choose from: {', '.join(AVAILABLE_STEMS)}"
         )
 
+    if vocal_method not in VOCAL_METHODS:
+        raise SeparationError(
+            f"Unknown vocal separation '{vocal_method}'. Choose from: {', '.join(VOCAL_METHODS)}"
+        )
+
     input_path = Path(input_path).resolve()
     validate_input(input_path)
 
@@ -241,6 +261,10 @@ def separate_stems(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(device_preference)
+
+    if vocal_method == "roformer" and stem in ("vocals", "all"):
+        return _separate_with_roformer(input_path, stem, out_dir, model, device, output_format, progress_callback)
+
     logging.info("Using device: %s | model: %s | stem: %s", device, model, stem)
 
     if progress_callback:
@@ -336,6 +360,213 @@ def separate_stems(
         progress_callback(1.0, "Done.")
 
     return output_paths
+
+
+# ---------------------------------------------------------------------------
+# RoFormer vocal separation
+# ---------------------------------------------------------------------------
+
+ROFORMER_SAMPLE_RATE = 44100
+
+
+def roformer_model_present() -> bool:
+    return (MODELS_DIR / ROFORMER_MODEL_FILE).is_file()
+
+
+def roformer_installed() -> bool:
+    """True if the audio-separator package (which runs RoFormer) is installed in this Python environment."""
+    import importlib.util
+    return importlib.util.find_spec("audio_separator") is not None
+
+
+VOCAL_METHOD_HELP = (
+    "What separates the vocals from the music. Used by Remove Vocals, Full Separation (4 stems) and the "
+    "Lyric Timing tab. Removing drums, bass or other always uses the Demucs model.\n\n"
+    "Demucs (current): the original behaviour.\n\n"
+    "RoFormer (cleaner vocals): Mel-Band RoFormer. About 20 s per song on the GPU (about 2.5 min on the CPU). "
+    "The vocals are cleaner between sung lines (about 10 dB less leftover music in the song tested). "
+    "For Full Separation, "
+    "Demucs then splits RoFormer's instrumental into drums, bass and other. The model (about 900 MB) is kept in "
+    "the project's models folder and is downloaded the first time if it is missing. Its weights are licensed "
+    "for non-commercial use only (CC BY-NC-SA 4.0)."
+)
+
+
+def vocal_method_label(method: str) -> str:
+    return VOCAL_METHODS.get(method, VOCAL_METHODS[DEFAULT_VOCAL_METHOD])
+
+
+def _run_roformer(mix, device: str, progress_callback, start: float, end: float):
+    """Split a (2, samples) float32 numpy array at 44.1 kHz into (vocals, instrumental) arrays of the same shape.
+
+    Uses audio-separator only to load the model and run it: its own file writer is skipped because it reduces the
+    output to 16-bit and re-normalises the volume, so the stems are saved by _save_audio like the Demucs ones.
+    Progress between start and end follows the model's own chunk counter."""
+    import sys
+    import os
+
+    # Under pythonw (launch.bat) there is no console; the model's progress bar would crash writing to None.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+
+    try:
+        import torch
+        from audio_separator.separator import Separator
+        from audio_separator.separator.architectures import mdxc_separator
+    except ImportError as e:
+        raise SeparationError(
+            "RoFormer vocal separation is not installed in this Python environment "
+            f"(missing: {getattr(e, 'name', None) or e}). Choose 'Demucs' for vocal separation in the "
+            "Advanced tab, or install it as described in README.md."
+        ) from e
+
+    def say(frac, msg):
+        if progress_callback:
+            progress_callback(frac, msg)
+
+    first_time = not roformer_model_present()
+    say(start, "Downloading the RoFormer model (about 900 MB, first time only)..." if first_time
+        else "Loading the RoFormer vocal model...")
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        import tempfile
+        sep = Separator(log_level=logging.WARNING, model_file_dir=str(MODELS_DIR),
+                        output_dir=tempfile.gettempdir(), sample_rate=ROFORMER_SAMPLE_RATE)
+        if device == "cpu":
+            sep.torch_device = sep.torch_device_cpu
+            sep.onnx_execution_provider = ["CPUExecutionProvider"]
+        sep.load_model(ROFORMER_MODEL_FILE)
+        model = sep.model_instance
+    except Exception as e:
+        hint = (" The model is downloaded the first time it is used; check the internet connection."
+                if first_time else "")
+        raise SeparationError(f"Could not load the RoFormer vocal model: {e}.{hint}") from e
+
+    load_share = 0.1 * (end - start)
+    run_start = start + load_share
+    say(run_start, "Separating vocals with RoFormer...")
+
+    original_tqdm = mdxc_separator.tqdm
+
+    def counting_tqdm(iterable, *args, **kwargs):
+        items = list(iterable)
+        for i, item in enumerate(items):
+            say(run_start + (end - run_start) * i / max(len(items), 1),
+                f"Separating vocals with RoFormer... ({i}/{len(items)})")
+            yield item
+
+    try:
+        mdxc_separator.tqdm = counting_tqdm
+        override = model._use_model_segment_override(mix.shape[1] / ROFORMER_SAMPLE_RATE) \
+            if hasattr(model, "_use_model_segment_override") else None
+        with torch.no_grad():
+            sources = model.demix(mix=mix, override_model_segment_size=override)
+    except Exception as e:
+        raise SeparationError(f"RoFormer vocal separation failed: {e}") from e
+    finally:
+        mdxc_separator.tqdm = original_tqdm
+        del sep, model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not isinstance(sources, dict) or "vocals" not in sources:
+        raise SeparationError("RoFormer did not return a vocal track.")
+    vocals = sources["vocals"]
+    instrumental = sources.get("other")
+    if instrumental is None:
+        instrumental = mix - vocals
+    say(end, "Vocals separated.")
+    return vocals, instrumental
+
+
+def _separate_with_roformer(input_path: Path, stem: str, out_dir: Path, model: str, device: str,
+                            output_format: str, progress_callback) -> list[Path]:
+    """stem='vocals': RoFormer gives <song>_vocals and <song>_no_vocals.
+    stem='all':    RoFormer gives the vocals; Demucs (the chosen model) then splits RoFormer's instrumental into
+                   drums, bass and other. Whatever Demucs still calls 'vocals' inside that instrumental (usually a
+                   lead instrument) is added to 'other', so nothing in the instrumental is thrown away."""
+    import numpy as np
+    import torch
+
+    logging.info("Using device: %s | vocals: RoFormer | stem: %s%s", device, stem,
+                 f" | instruments: {model}" if stem == "all" else "")
+
+    def say(frac, msg):
+        if progress_callback:
+            progress_callback(frac, msg)
+
+    say(0.0, "Loading audio...")
+    _tolerate_blocked_lameenc()
+    try:
+        from demucs.audio import AudioFile
+        waveform = AudioFile(input_path).read(streams=0, samplerate=ROFORMER_SAMPLE_RATE, channels=2)
+    except ImportError as e:
+        raise SeparationError(f"Required package not installed: {e}") from e
+    except Exception as e:
+        raise SeparationError(f"Could not read audio file: {e}") from e
+
+    mix = waveform.numpy().astype(np.float32)
+    vocals_end = 0.85 if stem == "vocals" else 0.5
+    vocals, instrumental = _run_roformer(mix, device, progress_callback, 0.05, vocals_end)
+    vocals = torch.from_numpy(np.ascontiguousarray(vocals, dtype=np.float32))
+    instrumental = torch.from_numpy(np.ascontiguousarray(instrumental, dtype=np.float32))
+
+    stems: list[tuple[str, "torch.Tensor"]]
+    if stem == "vocals":
+        stems = [("no_vocals", instrumental), ("vocals", vocals)]
+    else:
+        say(0.5, f"Loading model '{model}' for drums, bass and other...")
+        try:
+            from demucs.pretrained import get_model
+            from demucs.apply import apply_model
+            demucs_model = get_model(model)
+            demucs_model.to(device)
+            demucs_model.eval()
+        except Exception as e:
+            raise SeparationError(f"Failed to load model '{model}': {e}") from e
+        if demucs_model.samplerate != ROFORMER_SAMPLE_RATE:
+            raise SeparationError(f"Model '{model}' works at {demucs_model.samplerate} Hz; RoFormer needs a "
+                                  f"{ROFORMER_SAMPLE_RATE} Hz model such as htdemucs_ft for the full separation.")
+        names = list(demucs_model.sources)
+        say(0.55, "Separating drums, bass and other from the instrumental...")
+        try:
+            with torch.no_grad():
+                parts = apply_model(demucs_model, instrumental.unsqueeze(0).to(device),
+                                    device=device, progress=False).squeeze(0).cpu()
+        except Exception as e:
+            raise SeparationError(f"Stem separation failed: {e}") from e
+        del demucs_model
+        by_name = {n: parts[i] for i, n in enumerate(names)}
+        leftover = by_name.pop("vocals", None)
+        if leftover is not None and "other" in by_name:
+            by_name["other"] = by_name["other"] + leftover
+        by_name["vocals"] = vocals
+        stems = [(n, by_name[n]) for n in names if n in by_name]
+
+    fmt = output_format.lower()
+    say(0.85, f"Saving output files ({'MP3 (320kbps)' if fmt == 'mp3' else 'WAV (24-bit)'})...")
+    output_paths = []
+    try:
+        for label, audio in stems:
+            out_path = out_dir / f"{input_path.stem}_{label}.{fmt}"
+            _save_audio(audio, ROFORMER_SAMPLE_RATE, out_path, fmt)
+            _copy_metadata(input_path, out_path, label)
+            output_paths.append(out_path)
+            logging.info("Output: %s", out_path)
+    except SeparationError:
+        raise
+    except Exception as e:
+        raise SeparationError(f"Failed to write output files: {e}") from e
+
+    say(1.0, "Done.")
+    return output_paths
+
+
+def list_vocal_methods() -> dict[str, str]:
+    return dict(VOCAL_METHODS)
 
 
 # ---------------------------------------------------------------------------

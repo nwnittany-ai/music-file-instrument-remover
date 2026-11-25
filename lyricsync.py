@@ -15,8 +15,9 @@ Device: --device auto (default) uses the GPU only when it has enough free memory
 fight a running animation job) and otherwise the CPU; gpu / cpu force a choice. If "auto" picks the
 GPU and still runs out of memory, it retries on the CPU.
 
-Vocal stems are cached in lyricsync_cache/ so re-running a song (e.g. after fixing a lyric) skips
-the slow Demucs step. The GUI's Lyric Timing tab calls run() below.
+The vocals are separated with Demucs (default) or Mel-Band RoFormer (--vocal-method roformer). Vocal stems are
+cached in lyricsync_cache/, one per song and method, so re-running a song (e.g. after fixing a lyric) skips the
+separation step. The GUI's Lyric Timing tab calls run() below.
 """
 
 from __future__ import annotations
@@ -102,24 +103,34 @@ def find_vocals(outputs: list[Path]) -> Path:
     raise lc.LyricSyncError(f"Vocal separation produced no vocals file: {[p.name for p in outputs]}")
 
 
-def _cache_folder(audio: Path, demucs_model: str) -> Path:
+def separator_key(demucs_model: str, vocal_method: str = "demucs") -> str:
+    """What makes the vocal stem: 'roformer', or the Demucs model name. Also names the cache folder, so stems made
+    by different separators are never mixed up."""
+    return "roformer" if vocal_method == "roformer" else demucs_model
+
+
+def _cache_folder(audio: Path, separator: str) -> Path:
     st = audio.stat()
-    return CACHE_DIR / f"{audio.stem}_{st.st_size}_{int(st.st_mtime)}_{demucs_model}"
+    return CACHE_DIR / f"{audio.stem}_{st.st_size}_{int(st.st_mtime)}_{separator}"
 
 
-def cached_vocals_path(audio: Path, demucs_model: str) -> Optional[Path]:
-    """The vocal stem for this exact file (name + size + modified time + model), if already made."""
-    folder = _cache_folder(audio, demucs_model)
+def cached_vocals_path(audio: Path, separator: str) -> Optional[Path]:
+    """The vocal stem for this exact file (name + size + modified time + separator), if already made."""
+    folder = _cache_folder(audio, separator)
     found = [p for p in sorted(folder.glob("*_vocals.wav")) if not p.stem.endswith("no_vocals")] if folder.is_dir() else []
     return found[0] if found else None
 
 
-def make_vocals(audio: Path, demucs_model: str, device_pref: str, progress: Progress) -> Path:
-    import core  # the existing Demucs wrapper in this project
+def make_vocals(audio: Path, separator: str, device_pref: str, progress: Progress) -> Path:
+    """separator: 'roformer' or a Demucs model name (see separator_key)."""
+    import core  # the existing separation wrapper in this project
 
-    progress(0.0, "Separating vocals with Demucs (the slow part)...")
-    outs = core.separate_stems(audio, stem="vocals", output_dir=_cache_folder(audio, demucs_model),
-                               model=demucs_model, device_preference=device_pref, output_format="wav",
+    roformer = separator == "roformer"
+    progress(0.0, "Separating vocals with RoFormer..." if roformer else "Separating vocals with Demucs (the slow part)...")
+    outs = core.separate_stems(audio, stem="vocals", output_dir=_cache_folder(audio, separator),
+                               model=core.DEFAULT_MODEL if roformer else separator,
+                               vocal_method="roformer" if roformer else "demucs",
+                               device_preference=device_pref, output_format="wav",
                                progress_callback=lambda frac, msg: progress(frac * 0.7, msg))
     return find_vocals(outs)
 
@@ -129,7 +140,7 @@ def make_vocals(audio: Path, demucs_model: str, device_pref: str, progress: Prog
 # ---------------------------------------------------------------------------
 
 def _pipeline(audio: Path, lyrics_text: str, output_dir: Path, model: str, device: str, language: str,
-              words: bool, vocals: Optional[Path], separate: bool, demucs_model: str, say: Progress) -> dict:
+              words: bool, vocals: Optional[Path], separate: bool, separator: str, say: Progress) -> dict:
     lines = lc.parse_lyrics(lyrics_text)
     title = lc.find_title(lyrics_text) or audio.stem
     say(0.0, f"{len(lines)} sung lines parsed ({sum(1 for l in lines if l.hint is not None)} with rough times).")
@@ -138,11 +149,11 @@ def _pipeline(audio: Path, lyrics_text: str, output_dir: Path, model: str, devic
         vocal_path = Path(vocals).resolve()
         say(0.7, f"Using existing vocal track: {vocal_path.name}")
     elif separate:
-        vocal_path = cached_vocals_path(audio, demucs_model)
+        vocal_path = cached_vocals_path(audio, separator)
         if vocal_path:
-            say(0.7, "Reusing the vocal track from last time.")
+            say(0.7, f"Reusing the vocal track from last time ({'RoFormer' if separator == 'roformer' else 'Demucs'}).")
         else:
-            vocal_path = make_vocals(audio, demucs_model, device, say)
+            vocal_path = make_vocals(audio, separator, device, say)
     else:
         vocal_path = audio
         say(0.7, "Skipping vocal separation (aligning against the full mix).")
@@ -174,8 +185,11 @@ def _pipeline(audio: Path, lyrics_text: str, output_dir: Path, model: str, devic
 
 def run(audio: Path, lyrics_text: str, output_dir: Path, model: str = "medium", device: str = "auto",
         language: str = "en", words: bool = False, vocals: Optional[Path] = None, separate: bool = True,
-        demucs_model: str = "htdemucs_ft", progress: Optional[Progress] = None) -> dict:
-    """device: 'auto' (GPU only if enough memory is free), 'gpu' or 'cpu'."""
+        demucs_model: str = "htdemucs_ft", progress: Optional[Progress] = None,
+        vocal_method: str = "demucs") -> dict:
+    """device: 'auto' (GPU only if enough memory is free), 'gpu' or 'cpu'.
+    vocal_method: 'demucs' (demucs_model makes the vocal stem) or 'roformer'."""
+    separator = separator_key(demucs_model, vocal_method)
     say: Progress = progress or (lambda frac, msg: print(msg))
     audio = Path(audio).resolve()
     if not audio.is_file():
@@ -183,11 +197,11 @@ def run(audio: Path, lyrics_text: str, output_dir: Path, model: str = "medium", 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    need_demucs = bool(separate and not vocals and cached_vocals_path(audio, demucs_model) is None)
+    need_demucs = bool(separate and not vocals and cached_vocals_path(audio, separator) is None)
     chosen, note = choose_device(device, needed_gb(model, need_demucs))
     say(0.0, note)
     args = (audio, lyrics_text, output_dir, model)
-    rest = (language, words, vocals, separate, demucs_model, say)
+    rest = (language, words, vocals, separate, separator, say)
     try:
         result = _pipeline(*args, chosen, *rest)
     except Exception as exc:
@@ -219,12 +233,15 @@ def main() -> None:
     ap.add_argument("--vocals", type=Path, help="use this existing vocal-only file instead of separating")
     ap.add_argument("--no-separate", action="store_true", help="align against the full mix (less accurate)")
     ap.add_argument("--demucs-model", default="htdemucs_ft")
+    ap.add_argument("--vocal-method", choices=["demucs", "roformer"], default="demucs",
+                    help="what separates the vocals: demucs (default, uses --demucs-model) or roformer")
     a = ap.parse_args()
     try:
         if not a.lyrics.is_file():
             raise lc.LyricSyncError(f"Lyrics file not found: {a.lyrics}")
         res = run(a.audio, a.lyrics.read_text(encoding="utf-8-sig"), a.output_dir or a.audio.resolve().parent,
-                  a.model, a.device, a.language, a.words, a.vocals, not a.no_separate, a.demucs_model)
+                  a.model, a.device, a.language, a.words, a.vocals, not a.no_separate, a.demucs_model,
+                  vocal_method=a.vocal_method)
         print()
         print(res["report"])
         print()

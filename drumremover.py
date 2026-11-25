@@ -61,7 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Models:\n"
             "  htdemucs_ft  — best quality, recommended (default)\n"
             "  htdemucs     — fast, good quality\n"
-            "  mdx_extra    — alternative architecture\n"
+            "  mdx_extra    — alternative architecture\n\n"
+            "Vocal separation (--vocals, used for --stem vocals and --stem all):\n"
+            "  demucs    — the Demucs model does it (default)\n"
+            "  roformer  — Mel-Band RoFormer: cleaner vocals; for 'all', Demucs then splits\n"
+            "              the instrumental into drums, bass and other\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -71,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stem to separate: drums, vocals, bass, other, all (default: drums)")
     p.add_argument("--model",       "-m", metavar="MODEL", default=None,
                    help="Demucs model (default from config, usually htdemucs_ft)")
+    p.add_argument("--vocals",      "-v", choices=["demucs", "roformer"], default=None,
+                   help="Vocal separation for --stem vocals/all (default from config, usually demucs)")
     p.add_argument("--format",      "-f", choices=["wav", "mp3"], default=None,
                    help="Output format: wav (24-bit, default) or mp3 (320kbps)")
     p.add_argument("--device",      "-d", choices=["gpu", "cpu"], default=None,
@@ -94,6 +100,10 @@ def main() -> int:
         print("Available models:")
         for m in list_models():
             print(f"  {m}")
+        from core import list_vocal_methods
+        print("\nVocal separation (--vocals, only for --stem vocals and --stem all):")
+        for key, label in list_vocal_methods().items():
+            print(f"  {key:<9} {label}")
         return 0
 
     if args.list_stems:
@@ -117,6 +127,7 @@ def main() -> int:
     device        = args.device or cfg.get("device",        "gpu")
     stem          = args.stem   or cfg.get("stem",          "drums")
     output_format = args.format or cfg.get("output_format", "wav")
+    vocal_method  = args.vocals or cfg.get("vocal_method",  "demucs")
 
     input_path = Path(args.input)
     output_dir = Path(args.output) if args.output else None
@@ -141,12 +152,17 @@ def main() -> int:
     print(f"  Output: {output_paths[0].parent}")
     print(f"  Mode  : {label}")
     print(f"  Format: {output_format.upper()}")
-    print(f"  Model : {model}  |  Device: {device}")
+    if vocal_method == "roformer" and stem == "vocals":
+        print(f"  Model : RoFormer (vocals)  |  Device: {device}")
+    elif vocal_method == "roformer" and stem == "all":
+        print(f"  Model : RoFormer (vocals) + {model} (instruments)  |  Device: {device}")
+    else:
+        print(f"  Model : {model}  |  Device: {device}")
     print()
 
     start = time.time()
-    logging.info("Starting — input=%s  stem=%s  model=%s  device=%s",
-                 input_path, stem, model, device)
+    logging.info("Starting — input=%s  stem=%s  model=%s  vocals=%s  device=%s",
+                 input_path, stem, model, vocal_method, device)
 
     try:
         results = separate_stems(
@@ -157,6 +173,7 @@ def main() -> int:
             device_preference=device,
             output_format=output_format,
             progress_callback=cli_progress,
+            vocal_method=vocal_method,
         )
     except SeparationError as e:
         print(f"\nError: {e}", file=sys.stderr)

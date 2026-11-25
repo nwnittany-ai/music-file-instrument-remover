@@ -13,7 +13,9 @@ Strip drum tracks from home demo recordings before uploading to Suno AI. Suno ge
 - **GPU-accelerated** — uses CUDA by default (NVIDIA GPU required for best performance)
 - **High-quality separation** — uses Demucs `htdemucs_ft` model by default
 - **Overwrite protection** — warns before overwriting existing output files
-- **Persistent settings** — model, device, and default directories saved between sessions
+- **Persistent settings** — model, vocal separation, device, and default directories saved between sessions
+- **Optional RoFormer vocals** — cleaner vocal stems for Remove Vocals, Full Separation and Lyric Timing (see below)
+- **Hover help** — rest the mouse on a setting or mode for a short explanation
 
 ## Output
 
@@ -52,6 +54,42 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 ```
 
+### 5. (Optional) Install RoFormer for cleaner vocals
+Only needed for **Vocal separation: RoFormer** (see below). The constraints file is essential: without it pip
+replaces the GPU build of PyTorch with a CPU-only one, and everything quietly stops using the GPU.
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-roformer.txt -c constraints-roformer.txt --extra-index-url https://download.pytorch.org/whl/cu128
+```
+Then check the GPU is still in use (should print `2.11.0+cu128 True`):
+```powershell
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+The model itself (`vocals_mel_band_roformer.ckpt`, about 900 MB) is kept in the `models\` folder. If it is missing
+it is downloaded automatically the first time RoFormer is used.
+
+## Vocal separation: Demucs or RoFormer
+
+**Advanced tab → Vocal separation** (CLI: `--vocals demucs|roformer`) chooses what separates the vocals:
+
+| Choice | What it does |
+|---|---|
+| **Demucs (current)** | The default. The Demucs model does everything, as before. |
+| **RoFormer (cleaner vocals)** | Mel-Band RoFormer separates the vocals. About 20 s per song on the GPU (about 2.5 min on the CPU), using about 4 GB of GPU memory. Between sung lines the vocal track is much cleaner (about 10 dB less leftover music in the song tested). |
+
+It is used by:
+- **Remove Vocals**: gives `<song>_vocals` and `<song>_no_vocals` (the instrumental).
+- **Full Separation (4 stems)**: with RoFormer, RoFormer makes the vocals and the Demucs model then splits RoFormer's
+  instrumental into drums, bass and other. That keeps the singing out of the other stems. Anything Demucs still
+  calls "vocals" in the instrumental (usually a lead instrument) goes into `other`, so nothing is lost. About 35 s per song on the GPU.
+- **Lyric Timing**: the vocal track it lines the lyrics up with. Each song's vocals are cached once per method.
+
+**Removing drums, bass or other is not affected**: it always uses the Demucs model, and its output is unchanged.
+
+The Main and Lyric Timing tabs show which method will be used; hover over any of these controls for details. If
+RoFormer is selected but not installed, those tabs show a red warning, and a run stops with a plain message saying so.
+
+The RoFormer weights (by Kimberley Jensen) are licensed **CC BY-NC-SA 4.0: non-commercial use only**.
+
 ## Usage
 
 ### GUI
@@ -64,8 +102,11 @@ pip install -r requirements.txt
 .\.venv\Scripts\python.exe drumremover.py --input "C:\Music\demo.mp3"
 .\.venv\Scripts\python.exe drumremover.py --input "C:\Music\demo.mp3" --output "C:\Music\Output"
 .\.venv\Scripts\python.exe drumremover.py --input "C:\Music\demo.mp3" --model htdemucs --device cpu
+.\.venv\Scripts\python.exe drumremover.py --input "C:\Music\demo.mp3" --stem vocals --vocals roformer
+.\.venv\Scripts\python.exe drumremover.py --input "C:\Music\demo.mp3" --stem all --vocals roformer
 .\.venv\Scripts\python.exe drumremover.py --list-models
 ```
+`--list-models` also lists the vocal separation choices. Without `--vocals`, the Advanced tab's saved setting is used.
 
 ## Project Structure
 
@@ -73,9 +114,13 @@ pip install -r requirements.txt
 music-file-instrument-remover/
 ├── drumremover.py      # CLI entry point
 ├── gui.py              # GUI (tkinter wrapper around core.py)
-├── core.py             # All Demucs processing logic (shared by CLI and GUI)
+├── core.py             # All separation logic, Demucs and RoFormer (shared by CLI and GUI)
 ├── config.py           # Settings persistence
+├── tooltip.py          # Hover help for GUI controls
+├── lyricsync.py        # Lyric timing CLI (lyricsync_core.py, lyricsync_tab.py = logic, GUI tab)
 ├── requirements.txt    # Python dependencies (excluding PyTorch)
+├── requirements-roformer.txt / constraints-roformer.txt   # optional RoFormer install (keeps GPU PyTorch)
+├── models/             # RoFormer model file (git-ignored, ~900 MB)
 ├── CLAUDE.md           # Project brief and architecture notes
 └── logs/               # Log files (git-ignored)
 ```
@@ -86,10 +131,6 @@ Planned features (not yet implemented):
 
 - Desktop icon / shortcut launcher
 - Batch processing (multiple files or entire folder)
-- Full 4-stem separation (drums, bass, vocals, other)
-- Vocal removal
-- Bass / guitar isolation
-- Output format selector (WAV vs MP3)
 - Drag and drop support
 - Waveform preview
 
@@ -105,9 +146,11 @@ Timestamps a lyrics text file against a song (e.g. for planning video/animation 
 python lyricsync.py "song.mp3" lyrics.txt
 python lyricsync.py "song.mp3" lyrics.txt --words          # per-word tags in the .lrc
 python lyricsync.py "song.mp3" lyrics.txt --vocals "song_vocals.wav"   # reuse an existing vocal stem
+python lyricsync.py "song.mp3" lyrics.txt --vocal-method roformer       # separate the vocals with RoFormer
 ```
 
-It separates the vocals with Demucs, then force-aligns the lyrics to them with stable-ts (Whisper
+It separates the vocals with Demucs (or RoFormer: `--vocal-method roformer`, or the Advanced tab's Vocal separation
+setting in the GUI), then force-aligns the lyrics to them with stable-ts (Whisper
 `medium` by default; `--model large-v3` for harder songs). Lyrics format: one sung line per line;
 `[Section]` labels, a `[title] ...` line and lines with no letters are skipped (so are echo lines written
 in parentheses, such as `(Who will he see next?)` - they are not timed). A line of only punctuation such as `...`
@@ -159,14 +202,14 @@ to the aligner with the line before them (so a held last note is not shared out 
 their own in the output.
 Tests (no pytest or model needed): `.venv\Scripts\python.exe tests\test_lyricsync.py`.
 Scoring against known-good timings: `.venv\Scripts\python.exe tests\score_lyricsync.py` (add `--run` to re-run the tool
-on each song first). It compares each line's start with a reference answer kept in `test_data\reference\` (git-ignored,
+on each song first, and `--vocal-method roformer` to make those runs use RoFormer vocals). It compares each line's start with a reference answer kept in `test_data\reference\` (git-ignored,
 because it holds lyrics and song paths; the format is described at the top of the script) and prints how many lines are
 within tolerance, the median and worst errors, and the worst lines. Add a reference for any song whose timing you have
 corrected by hand, and a change to the tool is judged by whether these numbers improve without any song getting worse.
 
 The GUI has the same thing as the **Lyric Timing** tab (paste lyrics, pick a song, copy the result).
-Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ignored) so a re-run
-of the same song skips Demucs. After the first alignment pass, any line that failed, sits where the
+Both use `lyricsync.run()`. Vocal stems are cached in `lyricsync_cache/` (git-ignored), one per song and vocal separation method, so a
+re-run of the same song skips the separation step. After the first alignment pass, any line that failed, sits where the
 vocal track is silent, or is far from its rough time is re-aligned on the audio between the
 nearest good lines; a retry is kept only if it leaves fewer bad lines.
 

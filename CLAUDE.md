@@ -144,6 +144,20 @@ These are known future features. Do not implement in the initial build. Claude C
 - **PyTorch with CUDA** — required for GPU acceleration on RTX 5060 Ti
 - **tkinter** — preferred for GUI (ships with Python on Windows, no extra install)
 - All dependencies should be installable via a `requirements.txt`
+- **Optional: audio-separator** (Mel-Band RoFormer vocals) — `requirements-roformer.txt`, installed WITH `-c constraints-roformer.txt`. Without the constraints file pip swaps the CUDA torch for a CPU-only build, which silently takes the GPU away from everything else. The 913 MB model lives in `models/` (git-ignored).
+
+---
+
+## Vocal Separation: Demucs or RoFormer (added 2026-11-24)
+
+- Setting `vocal_method` (`demucs` default | `roformer`): Advanced tab "Vocal separation", CLI `--vocals`, lyricsync CLI `--vocal-method`.
+- Applies ONLY to stem `vocals`, stem `all` and Lyric Timing. Removing drums/bass/other always uses Demucs and is bit-for-bit unchanged.
+- `roformer` + `vocals`: RoFormer makes `<song>_vocals` and `<song>_no_vocals` (instrumental = mix minus vocals).
+- `roformer` + `all`: RoFormer makes the vocals; the Demucs model splits RoFormer's instrumental into drums/bass/other, and whatever Demucs still labels "vocals" in it is added to `other`.
+- `core._run_roformer` uses audio-separator only to load the model and call `demix()`; its own writer is bypassed because it outputs 16-bit and re-normalises volume. Output goes through `_save_audio` (24-bit WAV / MP3) like Demucs.
+- Lyric Timing caches vocals per separator (`lyricsync_cache/<song>_<size>_<mtime>_roformer`).
+- Model weights (Kimberley Jensen) are CC BY-NC-SA 4.0: fine for this non-monetised use.
+- Every user-facing option needs: a clear label, a hover tooltip (`tooltip.py`), an entry in the CLI Reference tab and `--help`, and README text.
 
 ---
 

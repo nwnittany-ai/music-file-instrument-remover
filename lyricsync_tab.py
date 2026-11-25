@@ -12,7 +12,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import config
+import core
 import lyricsync
+from tooltip import add_tooltip
 
 MODELS = ["small", "medium", "large-v3"]
 
@@ -35,6 +37,18 @@ class LyricTimingTab:
         self._last_dir: Path | None = None
         self._full_text = ""
         self._build()
+
+    def refresh_separator_note(self):
+        """Show which method will separate the vocals (called again when the Advanced tab is saved)."""
+        method = self._cfg.get("vocal_method", core.DEFAULT_VOCAL_METHOD)
+        if method == "roformer" and not core.roformer_installed():
+            self._sep_var.set("Vocal separation: RoFormer is selected but not installed - choose Demucs in the "
+                              "Advanced tab (see README).")
+            self._sep_label.config(foreground="red")
+            return
+        name = "RoFormer" if method == "roformer" else f"Demucs {self._cfg.get('model', core.DEFAULT_MODEL)}"
+        self._sep_var.set(f"Vocal separation: {name}   (change in the Advanced tab; hover for details)")
+        self._sep_label.config(foreground="gray")
 
     # ------------------------------------------------------------------ layout
 
@@ -66,6 +80,17 @@ class LyricTimingTab:
         self._words_var = tk.BooleanVar(value=bool(self._cfg.get("lyric_words", False)))
         ttk.Checkbutton(opt, text="Per-word times in .lrc", variable=self._words_var).pack(side="left", padx=16)
         ttk.Label(opt, text="(large-v3 is slower but handles harder songs)", foreground="gray").pack(side="left")
+
+        sep_row = ttk.Frame(f)
+        sep_row.pack(fill="x", padx=12, pady=(0, 2))
+        self._sep_var = tk.StringVar()
+        self._sep_label = ttk.Label(sep_row, textvariable=self._sep_var, foreground="gray")
+        self._sep_label.pack(side="left", padx=6)
+        add_tooltip(self._sep_label, "The vocals are separated from the music first, then the lyrics are lined up "
+                                     "with them. This uses the Vocal separation setting in the Advanced tab.\n\n"
+                                     + core.VOCAL_METHOD_HELP + "\n\nEach song's vocal track is cached per method "
+                                     "(lyricsync_cache folder), so switching methods makes a new one the first time.")
+        self.refresh_separator_note()
 
         dev = ttk.LabelFrame(f, text="Processor")
         dev.pack(fill="x", **pad)
@@ -178,9 +203,11 @@ class LyricTimingTab:
             return
         model, words, device = self._model_var.get(), self._words_var.get(), self._device_var.get()
         demucs_model = self._cfg.get("model", "htdemucs_ft")
+        vocal_method = self._cfg.get("vocal_method", "demucs")
+        separator = lyricsync.separator_key(demucs_model, vocal_method)
         if device == "gpu":
             st = lyricsync.gpu_status()
-            need = lyricsync.needed_gb(model, lyricsync.cached_vocals_path(self._audio, demucs_model) is None)
+            need = lyricsync.needed_gb(model, lyricsync.cached_vocals_path(self._audio, separator) is None)
             if st and st[0] < need and not messagebox.askyesno(
                     "GPU is busy",
                     f"Only {st[0]:.1f} GB of GPU memory is free and this needs about {need:.1f} GB.\n"
@@ -208,7 +235,8 @@ class LyricTimingTab:
         def work():
             try:
                 res = lyricsync.run(audio, lyrics, out_dir, model=model, device=device, words=words,
-                                    demucs_model=demucs_model, progress=progress)
+                                    demucs_model=demucs_model, progress=progress,
+                                    vocal_method=vocal_method)
                 self._root.after(0, self._done, res)
             except Exception as exc:
                 self._root.after(0, self._failed, str(exc))

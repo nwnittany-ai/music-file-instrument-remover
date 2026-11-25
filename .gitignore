@@ -27,3 +27,13 @@ test_data/
 
 # cached vocal stems for lyricsync
 lyricsync_cache/
+
+# Backup and trial copies of the venv
+.venv_backup/
+.venv_roformer/
+
+# Separation model weights (large downloads)
+models/
+
+# pip freeze snapshots taken before venv changes (machine-specific)
+venv_snapshots/

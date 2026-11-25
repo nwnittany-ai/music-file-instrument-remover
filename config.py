@@ -12,6 +12,7 @@ DEFAULTS = {
     "default_input_dir": str(Path.home()),
     "default_output_dir": "",          # empty = same dir as input
     "model": "htdemucs_ft",
+    "vocal_method": "demucs",          # "demucs" or "roformer" - used for vocals, full separation, lyric timing
     "device": "gpu",
     "output_name_template": "{stem}_no_drums",
     "log_dir": str(Path(__file__).parent / "logs"),

@@ -15,6 +15,18 @@ from tkinter import filedialog, messagebox, ttk
 import config
 import core
 from lyricsync_tab import LyricTimingTab
+from tooltip import add_tooltip
+
+STEM_TIPS = {
+    "drums":  "Makes <song>_no_drums and <song>_drums. Uses the Demucs model set in the Advanced tab.",
+    "vocals": "Makes <song>_no_vocals and <song>_vocals. Uses the Vocal separation setting in the Advanced tab "
+              "(Demucs or RoFormer).",
+    "bass":   "Makes <song>_no_bass and <song>_bass. Uses the Demucs model set in the Advanced tab.",
+    "other":  "Makes <song>_no_other and <song>_other (guitar, keys and the rest). Uses the Demucs model set in "
+              "the Advanced tab.",
+    "all":    "Makes <song>_drums, _bass, _vocals and _other. With Vocal separation set to RoFormer (Advanced tab), "
+              "RoFormer makes the vocals and Demucs splits the rest into drums, bass and other.",
+}
 
 APP_TITLE = "Music File Instrument Remover"
 VERSION = "0.3.0"
@@ -67,7 +79,9 @@ class DrumRemoverApp(tk.Tk):
         messagebox.showinfo(
             "About",
             f"{APP_TITLE} v{VERSION}\n\n"
-            "Uses Facebook Research Demucs for AI stem separation.\n"
+            "Uses Facebook Research Demucs for AI stem separation, and optionally\n"
+            "Mel-Band RoFormer (Kimberley Jensen, via audio-separator) for vocals.\n"
+            "RoFormer weights: CC BY-NC-SA 4.0, non-commercial use only.\n"
             "GPU-accelerated via CUDA.",
         )
 
@@ -118,10 +132,20 @@ class DrumRemoverApp(tk.Tk):
 
         self._stem_var = tk.StringVar(value=self._cfg.get("stem", core.DEFAULT_STEM))
         for i, (key, label) in enumerate(core.STEM_LABELS.items()):
-            ttk.Radiobutton(
+            rb = ttk.Radiobutton(
                 stem_frame, text=label, variable=self._stem_var, value=key,
                 command=self._on_stem_changed,
-            ).grid(row=i // 2, column=i % 2, sticky="w", padx=16, pady=3)
+            )
+            rb.grid(row=i // 2, column=i % 2, sticky="w", padx=16, pady=3)
+            add_tooltip(rb, STEM_TIPS.get(key, ""))
+
+        # Which separator this mode will use (changes with the mode and the Advanced tab settings)
+        self._sep_note_var = tk.StringVar()
+        self._sep_note = ttk.Label(stem_frame, textvariable=self._sep_note_var, foreground="gray")
+        self._sep_note.grid(row=(len(core.STEM_LABELS) + 1) // 2, column=0, columnspan=2,
+                            sticky="w", padx=16, pady=(2, 6))
+        stem_frame.columnconfigure(1, weight=1)   # a long note widens column 1, so the buttons stay put
+        self._update_sep_note()
 
         # --- Output format ---
         fmt_frame = ttk.LabelFrame(f, text="Output Format")
@@ -177,7 +201,35 @@ class DrumRemoverApp(tk.Tk):
     def _action_label(self) -> str:
         return core.STEM_LABELS.get(self._stem_var.get(), "Separate Stems")
 
+    def _update_vocal_hint(self):
+        chosen = next((k for k, v in core.list_vocal_methods().items() if v == self._vocal_var.get()),
+                      core.DEFAULT_VOCAL_METHOD)
+        text = ("Used for Remove Vocals, Full Separation and Lyric Timing.\n"
+                "Removing drums, bass or other always uses the Demucs model above.\n"
+                "Click Save Settings to apply. Hover for details.")
+        color = "gray"
+        if chosen == "roformer" and not core.roformer_installed():
+            text = ("RoFormer is not installed in this Python environment, so runs that need it\n"
+                    "will stop with an error. Choose Demucs, or install it (see README).")
+            color = "red"
+        self._vocal_hint.config(text=text, foreground=color)
+
+    def _update_sep_note(self):
+        stem = self._stem_var.get()
+        method = self._cfg.get("vocal_method", core.DEFAULT_VOCAL_METHOD)
+        model = self._cfg.get("model", core.DEFAULT_MODEL)
+        if stem in ("vocals", "all") and method == "roformer":
+            text = ("Vocals: RoFormer" + (f"   Drums, bass, other: Demucs {model}" if stem == "all" else "")
+                    + "   (change in the Advanced tab)")
+            if not core.roformer_installed():
+                text = "RoFormer is selected but not installed - choose Demucs in the Advanced tab (see README)."
+        else:
+            text = f"Uses Demucs {model}   (change in the Advanced tab)"
+        self._sep_note_var.set(text)
+        self._sep_note.config(foreground="red" if text.startswith("RoFormer is selected") else "gray")
+
     def _on_stem_changed(self):
+        self._update_sep_note()
         self._run_btn.config(text=self._action_label())
         self._hide_open_folder_btn()
         self._status_var.set("Ready.")
@@ -231,6 +283,7 @@ class DrumRemoverApp(tk.Tk):
         code('  --format -f  wav|mp3    Output format (default: wav)')
         code('  --output -o  <dir>      Output directory (default: same as input)')
         code('  --model  -m  <model>    Demucs model (default: htdemucs_ft)')
+        code('  --vocals -v  demucs|roformer  Vocal separation for vocals/all (default: demucs)')
         code('  --device -d  gpu|cpu    Processing device (default: gpu)')
         code('  --list-stems          List available stems and exit')
         code('  --list-models         List available models and exit')
@@ -255,6 +308,14 @@ class DrumRemoverApp(tk.Tk):
         code('  mdx_extra_q  Quantized mdx_extra')
         blank()
 
+        h2("Vocal Separation (--vocals)")
+        code('  demucs    The Demucs model above does it  (default)')
+        code('  roformer  Mel-Band RoFormer: cleaner vocals, quieter gaps between lines.')
+        code('            With --stem all, Demucs then splits the instrumental into')
+        code('            drums, bass and other. Removing drums/bass/other is unaffected.')
+        code('  python drumremover.py --input "C:\\Music\\demo.mp3" --stem vocals --vocals roformer')
+        blank()
+
         h2("Examples")
         code('  python drumremover.py --input "C:\\Music\\demo.mp3"')
         code('  python drumremover.py --input "C:\\Music\\demo.mp3" --stem vocals')
@@ -276,7 +337,10 @@ class DrumRemoverApp(tk.Tk):
         blank()
 
         h2("Notes")
-        body('  • Output format is always 24-bit WAV (best quality for Suno uploads).')
+        body('  • Output is 24-bit WAV by default (best quality for Suno uploads), or 320 kbps MP3.')
+        body('  • Vocal separation (Advanced tab, or --vocals) applies to vocals, all, and the Lyric Timing tab;')
+        body('    lyricsync.py has the same choice as --vocal-method demucs|roformer.')
+        body('  • The RoFormer model (about 900 MB) is kept in the models/ folder; non-commercial licence.')
         body('  • GPU acceleration requires an NVIDIA GPU with CUDA support.')
         body('  • MP3 input requires ffmpeg to be installed and on your PATH.')
         body('  • Settings in the Advanced tab are saved to drumremover_config.json.')
@@ -320,9 +384,29 @@ class DrumRemoverApp(tk.Tk):
         # Model
         lbl("Demucs model:", row)
         self._model_var = tk.StringVar(value=self._cfg.get("model", core.DEFAULT_MODEL))
-        ttk.Combobox(f, textvariable=self._model_var,
-                     values=core.list_models(), state="readonly", width=36).grid(
-            row=row, column=1, sticky="ew", pady=6)
+        model_box = ttk.Combobox(f, textvariable=self._model_var,
+                                 values=core.list_models(), state="readonly", width=36)
+        model_box.grid(row=row, column=1, sticky="ew", pady=6)
+        add_tooltip(model_box, "The Demucs model used to remove drums, bass or other, and for Full Separation. "
+                               "When Vocal separation is RoFormer, it still splits drums, bass and other in "
+                               "Full Separation. htdemucs_ft is the best quality.")
+        row += 1
+
+        # Vocal separation (vocals, full separation and lyric timing; removing drums/bass/other always uses Demucs)
+        lbl("Vocal separation:", row)
+        methods = core.list_vocal_methods()
+        current = self._cfg.get("vocal_method", core.DEFAULT_VOCAL_METHOD)
+        self._vocal_var = tk.StringVar(value=methods.get(current, methods[core.DEFAULT_VOCAL_METHOD]))
+        vocal_box = ttk.Combobox(f, textvariable=self._vocal_var,
+                                 values=list(methods.values()), state="readonly", width=36)
+        vocal_box.grid(row=row, column=1, sticky="ew", pady=6)
+        vocal_box.bind("<<ComboboxSelected>>", lambda _e: self._update_vocal_hint())
+        add_tooltip(vocal_box, core.VOCAL_METHOD_HELP)
+        row += 1
+        self._vocal_hint = ttk.Label(f, foreground="gray", justify="left")
+        self._vocal_hint.grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        add_tooltip(self._vocal_hint, core.VOCAL_METHOD_HELP)
+        self._update_vocal_hint()
         row += 1
 
         # Device
@@ -403,10 +487,14 @@ class DrumRemoverApp(tk.Tk):
         self._cfg["default_input_dir"]  = self._def_input_var.get()
         self._cfg["default_output_dir"] = self._def_output_var.get()
         self._cfg["model"]              = self._model_var.get()
+        self._cfg["vocal_method"]       = next((k for k, v in core.list_vocal_methods().items()
+                                                if v == self._vocal_var.get()), core.DEFAULT_VOCAL_METHOD)
         self._cfg["device"]             = self._device_var.get()
         self._cfg["log_dir"]            = self._log_dir_var.get()
         config.save(self._cfg)
         self._update_output_label()
+        self._update_sep_note()
+        self._lyric_tab.refresh_separator_note()
         messagebox.showinfo("Settings", "Settings saved.")
 
     # ------------------------------------------------------------------
@@ -439,6 +527,7 @@ class DrumRemoverApp(tk.Tk):
 
         model  = self._cfg.get("model",  core.DEFAULT_MODEL)
         device = self._cfg.get("device", "gpu")
+        vocal_method = self._cfg.get("vocal_method", core.DEFAULT_VOCAL_METHOD)
 
         self._processing = True
         self._run_btn.config(state="disabled")
@@ -457,6 +546,7 @@ class DrumRemoverApp(tk.Tk):
                     device_preference=device,
                     output_format=output_format,
                     progress_callback=self._on_progress,
+                    vocal_method=vocal_method,
                 )
                 self.after(0, self._on_success, results)
             except core.SeparationError as e:

@@ -2,6 +2,7 @@
 
   .venv\\Scripts\\python.exe tests\\score_lyricsync.py                      score every reference in test_data\\reference\\
   .venv\\Scripts\\python.exe tests\\score_lyricsync.py --run                re-run the tool on each song first (slow: needs the GPU/CPU)
+  .venv\\Scripts\\python.exe tests\\score_lyricsync.py --run --vocal-method roformer   the same, with RoFormer vocals
   .venv\\Scripts\\python.exe tests\\score_lyricsync.py --result X_timing.json --reference test_data\\reference\\X.json
 
 A reference is a small JSON file kept in test_data\\reference\\ (git-ignored: it holds lyrics and song paths):
@@ -79,11 +80,11 @@ def show(s: dict) -> None:
         print(f"     {n:3d}  {err:5.1f}s  {got_s} -> {clock(want)}   {text[:40]}")
 
 
-def run_tool(reference: dict, ref_path: Path, out_dir: Path) -> dict:
+def run_tool(reference: dict, ref_path: Path, out_dir: Path, vocal_method: str = "demucs") -> dict:
     import lyricsync
     lyrics = (ref_path.parent / reference["lyrics_file"]).read_text(encoding="utf-8-sig")
     res = lyricsync.run(Path(reference["audio"]), lyrics, out_dir, model=reference.get("model", "large-v3"), device="auto",
-                        progress=lambda frac, msg: None)
+                        progress=lambda frac, msg: None, vocal_method=vocal_method)
     return json.loads(Path(res["files"]["json"]).read_text(encoding="utf-8"))
 
 
@@ -92,6 +93,8 @@ def main() -> int:
     ap.add_argument("--reference", type=Path, action="append", help="a reference file (default: all in test_data/reference)")
     ap.add_argument("--result", type=Path, help="score this _timing.json (needs exactly one --reference)")
     ap.add_argument("--run", action="store_true", help="re-run the tool on each reference song and score the new result")
+    ap.add_argument("--vocal-method", choices=["demucs", "roformer"], default="demucs",
+                    help="with --run: what separates the vocals (default demucs)")
     a = ap.parse_args()
     refs = a.reference or sorted(REFERENCE_DIR.glob("*.json"))
     if not refs:
@@ -106,7 +109,7 @@ def main() -> int:
             result = json.loads(a.result.read_text(encoding="utf-8"))
         elif a.run:
             with tempfile.TemporaryDirectory() as d:
-                result = run_tool(reference, ref_path, Path(d))
+                result = run_tool(reference, ref_path, Path(d), a.vocal_method)
         else:
             existing = Path(reference["audio"]).parent / "stem_output" / f"{Path(reference['audio']).stem}_timing.json"
             if not existing.is_file():
